@@ -1,4 +1,4 @@
-"""End-to-End Multi-Matrix Physics & Probabilistic Sequence Pipeline."""
+"""End-to-End Multi-Tier ML & Physics Ensemble Pipeline (Tier 1 + Tier 2 GBDT/EM + Tier 3 MS-TCN)."""
 
 import os
 import sys
@@ -18,7 +18,12 @@ from src.models.heuristic_fsm import (  # noqa: E402
     compute_tier1_emission_log_probs,
     detect_physical_regimes,
 )
-from src.models.pseudo_gbdt import fit_and_predict_tier2_emissions  # noqa: E402
+from src.models.pseudo_gbdt import (  # noqa: E402
+    _select_algorithmic_anchors,
+    fit_ball_dropout_gbdt_models,
+    fit_baum_welch_em,
+)
+from src.models.external_seq import fit_and_predict_stage2_temporal_refiner  # noqa: E402
 from src.decoder import decode_full_match  # noqa: E402
 
 
@@ -33,30 +38,67 @@ def write_submission_csv(path, labels):
     return path
 
 
-def run_physics_pipeline(game=GAME, data_dir=None, out_csv=None, seed=42):
-    """Run all 4 stages of the Multi-Matrix Physics Pipeline deterministically."""
+def run_ml_ensemble_pipeline(game=GAME, data_dir=None, out_csv=None, seed=42):
+    """Run all 4 stages including Tier 1 Physics, Tier 2 GBDT/EM, and Tier 3 Dilated Sequence ML."""
     np.random.seed(seed)
 
     # Stage 1: Load Homography, ATD, Kalman-RTS trajectories, Optical Flow & Jacobians
     stage1 = load_stage1_data(game=game, data_dir=data_dir)
-
-    # Stage 1B & 1C: Smart Tagging conjugate priors and Broadcast cross-camera sync
     st_priors = compute_smart_tagging_priors(stage1, game=game, data_dir=data_dir)
     bcast_sync = synchronize_broadcast_to_tactical(stage1, game=game, data_dir=data_dir)
 
-    # Stage 2: Extract multi-modal physics & matrix features
+    # Stage 2: Extract 88-feature tabular & sequence matrix (42 ball + 46 ball-free features)
     features = extract_physics_feature_dict(stage1, st_priors)
 
-    # Stage 3 (Tier 1 & Tier 2): Detect physical regimes & compute calibrated emission log-probs
+    # Stage 3 — Tier 1: Physical regimes & physics emission log-probabilities
     regimes = detect_physical_regimes(features, stage1["half_blocks"])
     tier1_log_probs = compute_tier1_emission_log_probs(features, regimes)
-    blended_log_probs = fit_and_predict_tier2_emissions(
-        features, regimes, tier1_log_probs, stage1["half_blocks"]
+
+    # Stage 3 — Tier 2A: Unsupervised Factored Baum-Welch EM HSMM
+    anchor_labels, graded_mask = _select_algorithmic_anchors(
+        features, regimes, stage1["half_blocks"]
     )
+    em_log_probs = fit_baum_welch_em(
+        features, regimes, tier1_log_probs, graded_mask, n_iter=4
+    )
+
+    # Stage 3 — Tier 2B: Out-of-Fold Temporal CV GBDT_Full (88 feat) & GBDT_NoBall (46 feat)
+    oof_probs_full, oof_probs_noball, gbdt_cv_metrics = fit_ball_dropout_gbdt_models(
+        features, anchor_labels, graded_mask, n_blocks=6, stride=4, seed=seed
+    )
+
+    # Stage 3 — Tier 3: Multi-Stage Dilated Temporal Neural Refiner with Sim2Real 41% Ball-Dropout
+    seq_log_probs, seq_metrics = fit_and_predict_stage2_temporal_refiner(
+        oof_probs_full,
+        oof_probs_noball,
+        features,
+        anchor_labels,
+        graded_mask,
+        stage1["half_blocks"],
+        stride=6,
+        seed=seed,
+    )
+
+    # Adaptive Missing-Ball Ensemble Gate across Tier 1 + Tier 2A + Tier 2B + Tier 3:
+    # When ball is visible: combine Tier 1 (0.45) + GBDT_Full (0.25) + SeqRefiner (0.15) + EM (0.10) + GBDT_NoBall (0.05)
+    # When ball is missing (41% NaN frames): rely on Tier 1 Bridge (0.50) + GBDT_NoBall Student (0.20) + SeqRefiner (0.20) + EM (0.10)
+    p_tier1 = np.exp(tier1_log_probs)
+    p_em = np.exp(em_log_probs)
+    p_seq = np.exp(seq_log_probs)
+
+    ball_seen = (features["raw_codes"] < 2)[:, None]
+    ensemble_probs = np.where(
+        ball_seen,
+        0.45 * p_tier1 + 0.25 * oof_probs_full + 0.15 * p_seq + 0.10 * p_em + 0.05 * oof_probs_noball,
+        0.50 * p_tier1 + 0.20 * oof_probs_noball + 0.20 * p_seq + 0.10 * p_em,
+    )
+    ensemble_probs = np.clip(ensemble_probs, 1e-6, 1.0)
+    ensemble_probs /= np.sum(ensemble_probs, axis=1, keepdims=True)
+    ensemble_log_probs = np.log(ensemble_probs)
 
     # Stage 4: Time-Inhomogeneous Viterbi/HSMM decoding, deflection filtering & boundary snapping
     labels = decode_full_match(
-        blended_log_probs, features, regimes, stage1["half_blocks"]
+        ensemble_log_probs, features, regimes, stage1["half_blocks"]
     )
 
     if out_csv:
@@ -69,5 +111,13 @@ def run_physics_pipeline(game=GAME, data_dir=None, out_csv=None, seed=42):
         "bcast_sync": bcast_sync,
         "features": features,
         "regimes": regimes,
-        "log_probs": blended_log_probs,
+        "log_probs": ensemble_log_probs,
+        "oof_probs_full": oof_probs_full,
+        "oof_probs_noball": oof_probs_noball,
+        "gbdt_cv_metrics": gbdt_cv_metrics,
+        "seq_metrics": seq_metrics,
     }
+
+
+# Keep backward-compatible alias
+run_physics_pipeline = run_ml_ensemble_pipeline
