@@ -20,6 +20,7 @@ from sklearn.metrics import accuracy_score
 
 
 DILATED_OFFSETS = (-150, -75, -35, -15, -5, 0, 5, 15, 35, 75, 150)
+CRISP_DILATED_OFFSETS = (-20, -10, -4, 0, 4, 10, 20)
 
 
 def build_dilated_temporal_context(prob_seq, features, offsets=DILATED_OFFSETS):
@@ -115,6 +116,8 @@ def fit_and_predict_stage2_temporal_refiner(
     half_blocks,
     stride=6,
     seed=42,
+    offsets=DILATED_OFFSETS,
+    n_smooth_steps=6,
 ):
     """Train the Stage-2 Dilated Temporal Neural Refiner with Sim2Real 41% Ball-Dropout."""
     n = len(stage1_probs)
@@ -131,8 +134,8 @@ def fit_and_predict_stage2_temporal_refiner(
         stage1_probs,
     )
 
-    X_seq_clean = build_dilated_temporal_context(eff_stage1_probs, features)
-    X_seq_corrupt = build_dilated_temporal_context(corrupted_stage1_probs, features)
+    X_seq_clean = build_dilated_temporal_context(eff_stage1_probs, features, offsets=offsets)
+    X_seq_corrupt = build_dilated_temporal_context(corrupted_stage1_probs, features, offsets=offsets)
 
     anchor_idx = np.flatnonzero(anchor_labels >= 0)[::stride]
     y_anc = anchor_labels[anchor_idx]
@@ -169,7 +172,7 @@ def fit_and_predict_stage2_temporal_refiner(
 
     log_refined = np.log(np.clip(refined_probs, 1e-6, 1.0))
     log_smoothed = apply_truncated_temporal_mse_smoothing(
-        log_refined, half_blocks, lam=0.35, tau=1.8, n_steps=6
+        log_refined, half_blocks, lam=0.35, tau=1.8, n_steps=n_smooth_steps
     )
 
     oof_acc_seq = float(accuracy_score(y_anc, np.argmax(refined_probs[anchor_idx], axis=1)))

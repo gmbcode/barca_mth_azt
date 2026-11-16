@@ -228,3 +228,119 @@ def fit_ball_dropout_gbdt_models(features, anchor_labels, graded_mask, n_blocks=
     }
 
     return oof_probs_full, oof_probs_noball, cv_metrics
+
+
+def fit_sentiment_specialist_gbdt_models(
+    features, anchor_labels, graded_mask, regimes=None, n_blocks=6, stride=4, seed=42
+):
+    """Train binary {H, A} live-team specialist models (GBDT_Alive_Full & GBDT_Alive_NoBall).
+
+    Uses sharp local live anchors (without 3s centered smearing) and drops >=40-frame centered/future
+    ball windows so ML models stay razor-sharp at turnover boundaries while capturing +/-0.8s
+    causal/anti-causal momentum, duel chaos, and homography kinematics.
+    """
+    X_full = features["X_full"]
+    # Select sharp local/causal ball signals (run_len=3, flips=4..6, ent=7, w8=[8,10,11,12,13], w20=[14,15,17,18,19], past40=23)
+    # and half-invariant ball-free kinematics [46,47,50,51,54,56,58,72,76,77] (no match_clock/reproj/flipped-side leakage)
+    keep_ball_cols = [3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 17, 18, 19, 23]
+    inv_noball_cols = [46, 47, 50, 51, 54, 56, 58, 72, 76, 77]
+    n_ball_cols = len(keep_ball_cols)
+    alive_full_idx = np.array(keep_ball_cols + inv_noball_cols, dtype=np.int32)
+    X_alive_full = X_full[:, alive_full_idx].copy()
+    X_noball = X_full[:, inv_noball_cols].copy()
+    n = len(X_full)
+
+    graded_indices = np.flatnonzero(graded_mask)
+    block_id = np.zeros(n, dtype=np.int32)
+    for b_idx, ch in enumerate(np.array_split(graded_indices, n_blocks)):
+        block_id[ch] = b_idx
+
+    # Build sharp live {H, A} anchors using short w=8 (0.32s) and w=20 (0.80s) consistency
+    raw = features["raw_codes"]
+    sh_c = features["alive_home_share"]
+    dead_m = regimes["dead_ball_mask"] if regimes is not None else (anchor_labels == 2)
+    sharp_h = graded_mask & (~dead_m) & (raw == 0) & (sh_c[:, 0] > 0.85) & (sh_c[:, 1] > 0.72)
+    sharp_a = graded_mask & (~dead_m) & (raw == 1) & (sh_c[:, 0] < 0.15) & (sh_c[:, 1] < 0.28)
+    sharp_y = np.full(n, -1, dtype=np.int8)
+    sharp_y[sharp_h] = 0
+    sharp_y[sharp_a] = 1
+
+    live_anchor_idx = np.flatnonzero((sharp_y == 0) | (sharp_y == 1))[::stride]
+    y_anc = sharp_y[live_anchor_idx]
+    b_anc = block_id[live_anchor_idx]
+
+    classes, counts = np.unique(y_anc, return_counts=True)
+    w_map = {int(c): float(len(y_anc)) / (2.0 * float(cnt)) for c, cnt in zip(classes, counts)}
+    w_anc = np.array([w_map[int(y)] for y in y_anc], dtype=np.float32)
+
+    oof_ha_full = np.full((n, 2), 0.5, dtype=np.float64)
+    oof_ha_noball = np.full((n, 2), 0.5, dtype=np.float64)
+    oof_anc_full = np.zeros((len(live_anchor_idx), 2), dtype=np.float64)
+    oof_anc_noball = np.zeros((len(live_anchor_idx), 2), dtype=np.float64)
+
+    rng = np.random.RandomState(seed)
+
+    def _build_bin_clf(f_seed, is_nb):
+        if HAS_XGB:
+            return XGBClassifier(
+                n_estimators=140 if not is_nb else 100,
+                max_depth=4 if not is_nb else 3,
+                learning_rate=0.05 if not is_nb else 0.04,
+                subsample=0.80,
+                colsample_bytree=0.70 if not is_nb else 0.80,
+                min_child_weight=30 if not is_nb else 80,
+                reg_lambda=5.0 if not is_nb else 10.0,
+                reg_alpha=1.0 if not is_nb else 2.0,
+                objective="binary:logistic",
+                random_state=f_seed,
+                n_jobs=4,
+                verbosity=0,
+            )
+        return HistGradientBoostingClassifier(
+            max_iter=140 if not is_nb else 100,
+            max_depth=4 if not is_nb else 3,
+            learning_rate=0.05,
+            min_samples_leaf=40 if not is_nb else 80,
+            l2_regularization=5.0 if not is_nb else 10.0,
+            random_state=f_seed,
+        )
+
+    for fold in range(n_blocks):
+        tr_m = b_anc != fold
+        va_m = b_anc == fold
+        va_all = block_id == fold
+
+        X_tr_f = X_alive_full[live_anchor_idx[tr_m]].copy()
+        # Sim2Real Ball-Dropout + Confusion Regularization: mask 35% of training rows' ball features
+        # and perturb remaining H/A share features so trees rely on multimodal kinematics during chaos/occlusion.
+        drop_m = rng.rand(len(X_tr_f)) < 0.35
+        X_tr_f[drop_m, :n_ball_cols] = 0.0
+        X_tr_f[~drop_m, 5:n_ball_cols] += rng.normal(
+            0.0, 0.25, size=(int(np.sum(~drop_m)), n_ball_cols - 5)
+        ).astype(np.float32)
+
+        y_tr = y_anc[tr_m]
+        w_tr = w_anc[tr_m]
+
+        clf_full = _build_bin_clf(seed + fold, is_nb=False)
+        clf_full.fit(X_tr_f, y_tr, sample_weight=w_tr)
+        oof_ha_full[va_all] = clf_full.predict_proba(X_alive_full[va_all])
+        oof_anc_full[va_m] = clf_full.predict_proba(X_alive_full[live_anchor_idx[va_m]])
+
+        X_tr_nb = X_noball[live_anchor_idx[tr_m]]
+        clf_nb = _build_bin_clf(seed + 100 + fold, is_nb=True)
+        clf_nb.fit(X_tr_nb, y_tr, sample_weight=w_tr)
+        oof_ha_noball[va_all] = clf_nb.predict_proba(X_noball[va_all])
+        oof_anc_noball[va_m] = clf_nb.predict_proba(X_noball[live_anchor_idx[va_m]])
+
+    oof_anc_full /= np.maximum(np.sum(oof_anc_full, axis=1, keepdims=True), 1e-12)
+    oof_anc_noball /= np.maximum(np.sum(oof_anc_noball, axis=1, keepdims=True), 1e-12)
+
+    metrics = {
+        "n_live_anchors": int(len(live_anchor_idx)),
+        "oof_ha_acc_full": float(accuracy_score(y_anc, np.argmax(oof_anc_full, axis=1))),
+        "oof_ha_logloss_full": float(log_loss(y_anc, oof_anc_full)),
+        "oof_ha_acc_noball": float(accuracy_score(y_anc, np.argmax(oof_anc_noball, axis=1))),
+        "oof_ha_logloss_noball": float(log_loss(y_anc, oof_anc_noball)),
+    }
+    return oof_ha_full, oof_ha_noball, metrics
