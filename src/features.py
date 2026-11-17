@@ -298,10 +298,45 @@ def extract_physics_feature_dict(stage1_data, st_priors):
     ctrl_h = np.where(has_full_atd & (raw_codes < 2), np.exp(-0.5 * (dh1 / 2.2) ** 2), (raw_codes == 0).astype(np.float64))
     ctrl_a = np.where(has_full_atd & (raw_codes < 2), np.exp(-0.5 * (da1 / 2.2) ** 2), (raw_codes == 1).astype(np.float64))
     min_d = np.minimum(dh1, da1)
-    in_flight = has_full_atd & (raw_codes < 2) & ((min_d > 2.7) | ((v_ball > 9.5) & (min_d > 1.7)))
+
+    # Matrix 10: Ball Carrying / Knock-On into Open Space (TTI) & Shooting Range Risk
+    tti_margin_ha = atd.get("tti_margin_ha", np.zeros(n, dtype=np.float64))
+    knock_on_h = atd.get("knock_on_h", np.zeros(n, dtype=bool))
+    knock_on_a = atd.get("knock_on_a", np.zeros(n, dtype=bool))
+    knock_on_any = knock_on_h | knock_on_a
+    open_carry_h = atd.get("open_carry_h", np.zeros(n, dtype=np.float64))
+    open_carry_a = atd.get("open_carry_a", np.zeros(n, dtype=np.float64))
+    space_ahead_h = atd.get("space_ahead_h", np.full(n, 12.0, dtype=np.float64))
+    space_ahead_a = atd.get("space_ahead_a", np.full(n, 12.0, dtype=np.float64))
+    d_goal_h = atd.get("d_goal_h", np.full(n, 52.65, dtype=np.float64))
+    d_goal_a = atd.get("d_goal_a", np.full(n, 52.65, dtype=np.float64))
+    n_def_cone_h = atd.get("n_def_cone_h", np.zeros(n, dtype=np.float64))
+    n_def_cone_a = atd.get("n_def_cone_a", np.zeros(n, dtype=np.float64))
+    shot_takeon_open_h = atd.get("shot_takeon_open_h", np.zeros(n, dtype=np.float64))
+    shot_takeon_open_a = atd.get("shot_takeon_open_a", np.zeros(n, dtype=np.float64))
+    shot_crowded_risk_h = atd.get("shot_crowded_risk_h", np.zeros(n, dtype=np.float64))
+    shot_crowded_risk_a = atd.get("shot_crowded_risk_a", np.zeros(n, dtype=np.float64))
+    shot_flight = atd.get("shot_flight", np.zeros(n, dtype=bool))
+    box_occ_h = atd.get("box_occ_h", np.zeros(n, dtype=np.float64))
+    box_occ_a = atd.get("box_occ_a", np.zeros(n, dtype=np.float64))
+    att_third_occ_diff = atd.get("att_third_occ_diff", np.zeros(n, dtype=np.float64))
+    pc_ball_log_odds = atd.get("pc_ball_log_odds", np.zeros(n, dtype=np.float64))
+    pc_cam_log_odds = atd.get("pc_cam_log_odds", np.zeros(n, dtype=np.float64))
+
+    # Exempt open-space sprint knock-on carries (79.3% team-kept) from in-flight emission damping!
+    raw_in_flight = has_full_atd & (raw_codes < 2) & ((min_d > 2.7) | ((v_ball > 9.5) & (min_d > 1.7)))
+    in_flight = raw_in_flight & (~knock_on_any)
 
     log_width_ratio = atd.get("log_width_ratio", np.zeros(n, dtype=np.float64))
     log_depth_ratio = atd.get("log_depth_ratio", np.zeros(n, dtype=np.float64))
+    eig1_h = atd.get("eig1_h", np.full(n, 150.0, dtype=np.float64))
+    eig2_h = atd.get("eig2_h", np.full(n, 100.0, dtype=np.float64))
+    eig1_a = atd.get("eig1_a", np.full(n, 150.0, dtype=np.float64))
+    eig2_a = atd.get("eig2_a", np.full(n, 100.0, dtype=np.float64))
+    low_line_h = atd.get("low_line_h", pose["cam_x_m"])
+    high_line_h = atd.get("high_line_h", pose["cam_x_m"])
+    low_line_a = atd.get("low_line_a", pose["cam_x_m"])
+    high_line_a = atd.get("high_line_a", pose["cam_x_m"])
     pin_mean_a = atd.get("pin_mean_a", np.zeros(n, dtype=np.float64))
     pin_mean_h = atd.get("pin_mean_h", np.zeros(n, dtype=np.float64))
     press_cap_on_h = atd.get("press_cap_on_h", np.zeros(n, dtype=np.float64))
@@ -316,10 +351,21 @@ def extract_physics_feature_dict(stage1_data, st_priors):
     cax = atd.get("centroid_ax", pose["cam_x_m"])
     hx_att = np.where(half_sign > 0, chx / 105.3, 1.0 - chx / 105.3)
     ax_att = np.where(half_sign > 0, cax / 105.3, 1.0 - cax / 105.3)
+    low_h_att = np.where(half_sign > 0, low_line_h / 105.3, 1.0 - high_line_h / 105.3)
+    high_h_att = np.where(half_sign > 0, high_line_h / 105.3, 1.0 - low_line_h / 105.3)
+    low_a_att = np.where(half_sign > 0, low_line_a / 105.3, 1.0 - high_line_a / 105.3)
+    high_a_att = np.where(half_sign > 0, high_line_a / 105.3, 1.0 - low_line_a / 105.3)
     bx_att = np.where(half_sign > 0, bk["x_smooth"] / 105.3, 1.0 - bk["x_smooth"] / 105.3)
     ms_h = np.nan_to_num(atd.get("mean_speed_h", atd["mean_speed_all"]), nan=2.0)
     ms_a = np.nan_to_num(atd.get("mean_speed_a", atd["mean_speed_all"]), nan=2.0)
     ret_prior = atd.get("track_retention_prior", np.full(n, 0.5, dtype=np.float64))
+
+    att3_cs = np.concatenate(([0.0], np.cumsum(att_third_occ_diff, dtype=np.float64)))
+    cent_diff_h = hx_att - ax_att
+    cent_cs = np.concatenate(([0.0], np.cumsum(cent_diff_h, dtype=np.float64)))
+    pcc_cs = np.concatenate(([0.0], np.cumsum(pc_cam_log_odds, dtype=np.float64)))
+    haz_cs = np.concatenate(([0.0], np.cumsum(net_press_hazard_h, dtype=np.float64)))
+    lag_25 = np.clip(idx_all - 25, 0, n - 1)
 
     X_noball_inv = np.column_stack([
         cam_x_attack_h,
@@ -366,6 +412,26 @@ def extract_physics_feature_dict(stage1_data, st_priors):
         ms_h / 5.0,
         ms_a / 5.0,
         st_priors["st_net_log_odds"],
+        low_h_att,
+        high_h_att,
+        low_a_att,
+        high_a_att,
+        low_h_att - low_a_att,
+        high_h_att - high_a_att,
+        eig1_h / 400.0,
+        eig1_a / 400.0,
+        eig2_h / 200.0,
+        eig2_a / 200.0,
+        box_occ_h / 10.0,
+        box_occ_a / 10.0,
+        att_third_occ_diff / 10.0,
+        pc_cam_log_odds / 5.0,
+        _pmean(att3_cs, 25) / 10.0,
+        _pmean(cent_cs, 25),
+        _pmean(pcc_cs, 25) / 5.0,
+        _pmean(haz_cs, 25),
+        (pc_cam_log_odds - pc_cam_log_odds[lag_25]) / 5.0,
+        cent_diff_h - cent_diff_h[lag_25],
     ]).astype(np.float32)
 
     X_ctrl_atd = np.column_stack([
@@ -382,6 +448,18 @@ def extract_physics_feature_dict(stage1_data, st_priors):
         in_flight.astype(np.float32),
         bx_att,
         ret_prior - 0.5,
+        tti_margin_ha,
+        knock_on_h.astype(np.float32) - knock_on_a.astype(np.float32),
+        open_carry_h - open_carry_a,
+        np.clip(space_ahead_h, 0.0, 35.0) / 15.0,
+        np.clip(space_ahead_a, 0.0, 35.0) / 15.0,
+        np.clip(space_ahead_h - space_ahead_a, -35.0, 35.0) / 15.0,
+        shot_takeon_open_h - shot_takeon_open_a,
+        shot_crowded_risk_h - shot_crowded_risk_a,
+        np.clip(d_goal_h, 0.0, 105.3) / 50.0,
+        np.clip(d_goal_a, 0.0, 105.3) / 50.0,
+        shot_flight.astype(np.float32),
+        pc_ball_log_odds / 5.0,
     ]).astype(np.float32)
 
     features = {
@@ -437,6 +515,28 @@ def extract_physics_feature_dict(stage1_data, st_priors):
         "n_free_outlets_h": n_free_outlets_h,
         "n_free_outlets_a": n_free_outlets_a,
         "net_press_hazard_h": net_press_hazard_h,
+        "tti_margin_ha": tti_margin_ha,
+        "knock_on_h": knock_on_h,
+        "knock_on_a": knock_on_a,
+        "knock_on_any": knock_on_any,
+        "open_carry_h": open_carry_h,
+        "open_carry_a": open_carry_a,
+        "space_ahead_h": space_ahead_h,
+        "space_ahead_a": space_ahead_a,
+        "d_goal_h": d_goal_h,
+        "d_goal_a": d_goal_a,
+        "n_def_cone_h": n_def_cone_h,
+        "n_def_cone_a": n_def_cone_a,
+        "shot_takeon_open_h": shot_takeon_open_h,
+        "shot_takeon_open_a": shot_takeon_open_a,
+        "shot_crowded_risk_h": shot_crowded_risk_h,
+        "shot_crowded_risk_a": shot_crowded_risk_a,
+        "shot_flight": shot_flight,
+        "box_occ_h": box_occ_h,
+        "box_occ_a": box_occ_a,
+        "att_third_occ_diff": att_third_occ_diff,
+        "pc_ball_log_odds": pc_ball_log_odds,
+        "pc_cam_log_odds": pc_cam_log_odds,
         "d_home_1": dh1,
         "d_away_1": da1,
         "ctrl_h": ctrl_h,

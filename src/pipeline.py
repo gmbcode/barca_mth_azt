@@ -24,7 +24,11 @@ from src.models.pseudo_gbdt import (  # noqa: E402
     fit_baum_welch_em,
     fit_sentiment_specialist_gbdt_models,
 )
-from src.models.external_seq import CRISP_DILATED_OFFSETS, fit_and_predict_stage2_temporal_refiner  # noqa: E402
+from src.models.external_seq import (  # noqa: E402
+    CRISP_DILATED_OFFSETS,
+    fit_and_predict_stage2_temporal_refiner,
+    fit_oof_path_crf_boundary_model,
+)
 from src.models.sentiment_hybrid import (  # noqa: E402
     SENTIMENT_NAMES,
     compute_match_sentiment_tensor,
@@ -184,6 +188,18 @@ def run_sentiment_hybrid_pipeline(game=GAME, data_dir=None, out_csv=None, seed=4
         spike_noise_rate=0.18,
     )
 
+    # Path-CRF Self-Supervised Boundary Edge Potential Classifier
+    p_boundary, boundary_metrics = fit_oof_path_crf_boundary_model(
+        features=features,
+        regimes=regimes,
+        sentiment=sentiment,
+        oof_ha_full=oof_ha_full,
+        oof_ha_noball=oof_ha_noball,
+        half_blocks=stage1["half_blocks"],
+        n_blocks=6,
+        seed=seed,
+    )
+
     # Sentiment-Adaptive OOF Meta-Stacked Fusion & Flick Directed Transition Gating
     (
         hybrid_log_probs,
@@ -201,6 +217,8 @@ def run_sentiment_hybrid_pipeline(game=GAME, data_dir=None, out_csv=None, seed=4
         oof_ha_noball=oof_ha_noball,
         seq_log_probs=seq_log_probs,
         spec_cv_metrics=spec_cv_metrics,
+        p_boundary=p_boundary,
+        boundary_metrics=boundary_metrics,
     )
     turnover_gate = 0.5 * (turnover_gate_ha + turnover_gate_ah)
 
@@ -238,5 +256,7 @@ def run_sentiment_hybrid_pipeline(game=GAME, data_dir=None, out_csv=None, seed=4
         "oof_ha_noball": oof_ha_noball,
         "spec_cv_metrics": spec_cv_metrics,
         "seq_metrics": seq_metrics,
+        "p_boundary": p_boundary,
+        "boundary_metrics": boundary_metrics,
         "routing_summary": routing_summary,
     }

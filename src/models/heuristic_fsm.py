@@ -296,6 +296,11 @@ def compute_tier1_emission_log_probs(features, regimes):
             + 0.5 * features["log_depth_ratio"]
         )
         bait_diff = features["bait_safety_h"] - features["bait_safety_a"]
+        carry_diff = features.get("open_carry_h", 0.0) - features.get("open_carry_a", 0.0)
+        tti_diff = features.get("tti_margin_ha", 0.0)
+        takeon_diff = features.get("shot_takeon_open_h", 0.0) - features.get("shot_takeon_open_a", 0.0)
+        crowd_diff = features.get("shot_crowded_risk_h", 0.0) - features.get("shot_crowded_risk_a", 0.0)
+        pc_ball = np.clip(features.get("pc_ball_log_odds", 0.0), -3.5, 3.5)
         log_odds_ha = (
             np.log((p_h_local + 0.08) / (p_a_local + 0.08))
             + 0.65 * (ctrl_h - ctrl_a)
@@ -303,6 +308,11 @@ def compute_tier1_emission_log_probs(features, regimes):
             + 0.16 * shape_comb
             - 0.28 * features["net_press_hazard_h"]
             + 0.28 * bait_diff
+            + 0.45 * carry_diff
+            + 0.32 * tti_diff
+            + 0.30 * takeon_diff
+            - 0.24 * crowd_diff
+            + 0.14 * pc_ball
         )
         log_odds_ha = np.where(in_flight, 0.55 * log_odds_ha, log_odds_ha)
     else:

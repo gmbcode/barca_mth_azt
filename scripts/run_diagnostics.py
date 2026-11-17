@@ -68,7 +68,7 @@ def run_honest_masked_ball_stress_test(res):
 
 
 def main():
-    out_csv = os.path.join(ROOT, "evaluation", "results", "sentiment_hybrid_v2.csv")
+    out_csv = os.path.join(ROOT, "evaluation", "results", "branch_to_submit.csv")
     res = run_sentiment_hybrid_pipeline(out_csv=out_csv)
     labels = res["labels"]
     pred_codes = pm.label_codes(labels)
@@ -76,22 +76,27 @@ def main():
     seq_m = res["seq_metrics"]
     rt = res["routing_summary"]
     sent = res["sentiment"]
+    feats = res["features"]
 
     print("=" * 88)
-    print("STAGE 3 SPECIALIST ML & SENTIMENT HYBRID v2 — 6-FOLD TEMPORAL BLOCK OOF CV DIAGNOSTICS")
+    print("STAGE 3 SPECIALIST ML & FINAL HYBRID — 6-FOLD TEMPORAL BLOCK OOF CV DIAGNOSTICS")
     print("=" * 88)
-    print(f"Live Anchors (Clean+Border, Stride 4): {cv['n_live_anchors']} (H/A binary live anchors)")
-    print(f"GBDT_Alive_Full (Causal+22-Inv, Drop): OOF Acc = {100*cv['oof_ha_acc_full']:.2f}% | "
+    print(f"Live Anchors (Clean+Border, Stride 3): {cv['n_live_anchors']} (H/A binary live anchors)")
+    print(f"GBDT_Alive_Full (Dual XGB+HGB, Drop) : OOF Acc = {100*cv['oof_ha_acc_full']:.2f}% | "
           f"LogLoss = {cv['oof_ha_logloss_full']:.4f}")
     print(f"GBDT_Alive_Full (Harsh Duel Stress)   : OOF Acc = {100*cv['oof_ha_acc_duel_stress']:.2f}% | "
           f"LogLoss = {cv['oof_ha_logloss_duel_stress']:.4f}")
-    print(f"GBDT_Alive_NoBall (22-Inv Territory)  : OOF Acc = {100*cv['oof_ha_acc_noball']:.2f}% | "
-          f"LogLoss = {cv['oof_ha_logloss_noball']:.4f}")
+    print(f"GBDT_Alive_NoBall (64-Inv Territory)  : OOF Acc = {100*cv['oof_ha_acc_noball']:.2f}% | "
+          f"AUC = {cv['oof_ha_auc_noball']:.4f} | LogLoss = {cv['oof_ha_logloss_noball']:.4f}")
+    print(f"Path-CRF Boundary Edge Model (OOF)    : AUC = {rt.get('oof_boundary_auc') or 0.0:.4f}")
     print(f"Crisp Dilated SeqRefiner (Spike Noise): OOF Acc = {100*seq_m['oof_acc_seq_refiner']:.2f}% | "
           f"Stress Acc = {100*seq_m['oof_acc_seq_stress']:.2f}% | Drop = {100*seq_m['sim2real_drop_rate']:.1f}%")
     print(f"OOF L-BFGS-B Meta-Router Weights      : w_chaos_boost={rt['meta_w_chaos_boost']:.4f}, "
           f"w_noball_in_ml={rt['meta_w_noball_in_ml']:.4f}, beta_flick_prior={rt['meta_beta_flick_prior']:.4f} "
           f"| OOF LogLoss = {rt['oof_meta_logloss']:.4f}")
+    print(f"Matrix 10 (Carry & Shot Regimes)      : knock_on_h={int(feats['knock_on_h'].sum())}, "
+          f"knock_on_a={int(feats['knock_on_a'].sum())}, shot_flight={int(feats['shot_flight'].sum())}, "
+          f"in_flight={int(feats['in_flight'].sum())}")
 
     # Match Sentiment Regime Breakdown on Graded Halves
     full_gt_dummy = np.full(len(labels), pm.X, dtype=np.int8)
@@ -160,6 +165,8 @@ def main():
             ("2. ML Ensemble (`model-fitting`)", "ml_ensemble_v1.csv"),
             ("3. Sentiment Hybrid (`sentiment-hybrid`)", "sentiment_hybrid_v1.csv"),
             ("4. Sentiment v2 (`sentiment-hybrid-v2`)", "sentiment_hybrid_v2.csv"),
+            ("5. Pressing-Pinning (`pressing-pinning-hybrid`)", "pressing_pinning_hybrid.csv"),
+            ("6. Final (`branch-to-submit`)", "branch_to_submit.csv"),
         ]:
             fpath = os.path.join(ROOT, "evaluation", "results", fname)
             if not os.path.isfile(fpath):

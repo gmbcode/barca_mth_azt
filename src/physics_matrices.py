@@ -765,3 +765,371 @@ def compute_press_and_pinning_matrices(
         "n_free_outlets_a": n_free_outlets_a,
         "net_press_hazard_h": net_press_hazard_h,
     }
+
+
+# ---------------------------------------------------------------------------
+# Matrix 10: ATD Re-ID Sanity, Open-Space Ball Carrying (TTI) & Shooting Range
+# ---------------------------------------------------------------------------
+
+def clean_atd_trajectories(
+    px_m,
+    py_m,
+    team_of_track,
+    gk_slots=(23, 45),
+    half_split_frame=90652,
+    pitch_length=105.3,
+    fps=25.0,
+):
+    """Mask impossible opponent-box goalkeeper ID swaps and zero out teleportation velocity spikes.
+
+    In broadcast/tactical ATD tracking, when the camera zooms tightly into one penalty box
+    leaving only one keeper visible, Metrica ATD occasionally assigns the wrong team's GK slot
+    inside that box (> 62m from their own goal). Masking wrong-end GK slots (outside brief
+    final-3% late-game corner kicks) prevents phantom 1-12s possession hijackings.
+    """
+    n_frames, n_slots = px_m.shape
+    px_clean = px_m.copy()
+    py_clean = py_m.copy()
+
+    is_h2 = (np.arange(n_frames) >= half_split_frame)[:, None]
+    gk_arr = [int(s) for s in gk_slots if 0 <= int(s) < n_slots]
+    if gk_arr:
+        # Late-match window (final 3% of each half) allows genuine GK corners if box is packed
+        half1_late = int(half_split_frame * 0.96)
+        half2_len = max(n_frames - half_split_frame, 1)
+        half2_late = half_split_frame + int(half2_len * 0.96)
+        f_idx = np.arange(n_frames)
+        late_window = ((~is_h2[:, 0]) & (f_idx >= half1_late)) | (is_h2[:, 0] & (f_idx >= half2_late))
+
+        for s in gk_arr:
+            sx = px_clean[:, s]
+            sy = py_clean[:, s]
+            valid_s = np.isfinite(sx) & np.isfinite(sy)
+            # Own defended goal: Home defends x=0 in H1, pitch_length in H2; Away opposite
+            if team_of_track[s] == 0:
+                d_own = np.where(is_h2[:, 0], pitch_length - sx, sx)
+                in_opp_box_mask = np.where(is_h2, px_clean < 25.0, px_clean > pitch_length - 25.0)
+            else:
+                d_own = np.where(is_h2[:, 0], sx, pitch_length - sx)
+                in_opp_box_mask = np.where(is_h2, px_clean > pitch_length - 25.0, px_clean < 25.0)
+            n_box = np.sum(np.isfinite(px_clean) & in_opp_box_mask, axis=1)
+            wrong_end = valid_s & (d_own > 62.0) & (~(late_window & (n_box >= 12)))
+            px_clean[wrong_end, s] = np.nan
+            py_clean[wrong_end, s] = np.nan
+
+    # Finite-pair central differences with teleportation guard (> 2.2m single-frame jump -> 0)
+    vx_ms = np.zeros((n_frames, n_slots), dtype=np.float64)
+    vy_ms = np.zeros((n_frames, n_slots), dtype=np.float64)
+    dt2 = 2.0 / float(fps)
+
+    step_ok = np.ones((n_frames, n_slots), dtype=bool)
+    if n_frames > 2:
+        jump_f = np.hypot(px_clean[2:] - px_clean[:-2], py_clean[2:] - py_clean[:-2])
+        step_ok[1:-1] = np.isfinite(jump_f) & (jump_f <= 3.6)
+        v_pair = (
+            np.isfinite(px_clean[:-2])
+            & np.isfinite(px_clean[2:])
+            & np.isfinite(py_clean[:-2])
+            & np.isfinite(py_clean[2:])
+            & step_ok[1:-1]
+        )
+        vx_ms[1:-1] = np.where(v_pair, np.clip((px_clean[2:] - px_clean[:-2]) / dt2, -12.0, 12.0), 0.0)
+        vy_ms[1:-1] = np.where(v_pair, np.clip((py_clean[2:] - py_clean[:-2]) / dt2, -12.0, 12.0), 0.0)
+
+    return px_clean, py_clean, vx_ms, vy_ms
+
+
+def compute_carry_and_shooting_matrices(
+    px_m,
+    py_m,
+    vx_ms,
+    vy_ms,
+    team_of_track,
+    ball_x_m,
+    ball_y_m,
+    ball_x_smooth,
+    ball_y_smooth,
+    vb_x_smooth,
+    vb_y_smooth,
+    v_ball_smooth,
+    cam_x_smooth,
+    cam_y_smooth,
+    pitch_length=105.3,
+    pitch_width=68.0,
+    half_split_frame=90652,
+    gk_slots=(23, 45),
+    chunk_size=4096,
+):
+    """Compute Matrix 10: Open-Space Knock-On Carrying, TTI Advantage & Shooting-Cone Dynamics.
+
+    Captures three physical decision mechanisms missed by pure nearest-player Voronoi:
+      1. Heavy-touch / knock-on carries in open space (`knock_on_h/a`): carrier pushes the ball
+         1.4..7.0m ahead into space while sprinting aligned with the ball ray and beating opponents'
+         Time-to-Intercept (TTI) -- avoids misclassifying fast solo dribbles as uncertain flight.
+      2. Shooting-range risk & take-on freedom (`shot_takeon_open_h/a`, `shot_crowded_risk_h/a`,
+         `shot_flight`): counts defenders inside the tapered shot cone to goalposts + 4m bubble;
+         open lanes favor solo take-on/carry stability while crowded cones elevate shot/block turns.
+      3. Ball-free attacking-third / penalty-box occupancy & camera pitch control (`att_third_occ_diff`,
+         `box_occ_h/a`, `pc_cam_log_odds`) for missing-ball prediction without nearest_slot leakage.
+    """
+    n_frames, n_slots = px_m.shape
+    slot_idx = np.arange(n_slots)
+    is_gk = np.isin(slot_idx, gk_slots)
+    h_all = team_of_track == 0
+    a_all = team_of_track == 1
+    h_out = h_all & (~is_gk)
+    a_out = a_all & (~is_gk)
+
+    gy = 0.5 * pitch_width
+    f_arr = np.arange(n_frames)
+    is_h2 = f_arr >= half_split_frame
+    gx_h = np.where(is_h2, 0.0, pitch_length)
+    gx_a = np.where(is_h2, pitch_length, 0.0)
+
+    # Output arrays
+    tti_margin_ha = np.zeros(n_frames, dtype=np.float64)
+    knock_on_h = np.zeros(n_frames, dtype=bool)
+    knock_on_a = np.zeros(n_frames, dtype=bool)
+    open_carry_h = np.zeros(n_frames, dtype=np.float64)
+    open_carry_a = np.zeros(n_frames, dtype=np.float64)
+    space_ahead_h = np.full(n_frames, 12.0, dtype=np.float64)
+    space_ahead_a = np.full(n_frames, 12.0, dtype=np.float64)
+
+    d_goal_h = np.hypot(ball_x_smooth - gx_h, ball_y_smooth - gy)
+    d_goal_a = np.hypot(ball_x_smooth - gx_a, ball_y_smooth - gy)
+    n_def_cone_h = np.zeros(n_frames, dtype=np.float64)
+    n_def_cone_a = np.zeros(n_frames, dtype=np.float64)
+    shot_takeon_open_h = np.zeros(n_frames, dtype=np.float64)
+    shot_takeon_open_a = np.zeros(n_frames, dtype=np.float64)
+    shot_crowded_risk_h = np.zeros(n_frames, dtype=np.float64)
+    shot_crowded_risk_a = np.zeros(n_frames, dtype=np.float64)
+    shot_flight = np.zeros(n_frames, dtype=bool)
+
+    box_occ_h = np.zeros(n_frames, dtype=np.float64)
+    box_occ_a = np.zeros(n_frames, dtype=np.float64)
+    att_third_occ_diff = np.zeros(n_frames, dtype=np.float64)
+    pc_ball_log_odds = np.zeros(n_frames, dtype=np.float64)
+    pc_cam_log_odds = np.zeros(n_frames, dtype=np.float64)
+
+    # Predicted ball landing point 0.28s ahead for Time-to-Intercept race
+    bpx = np.clip(ball_x_smooth + 0.28 * vb_x_smooth, 0.0, pitch_length)
+    bpy = np.clip(ball_y_smooth + 0.28 * vb_y_smooth, 0.0, pitch_width)
+
+    def _sigmoid_arr(z):
+        return 1.0 / (1.0 + np.exp(-np.clip(z, -12.0, 12.0)))
+
+    for s0 in range(0, n_frames, chunk_size):
+        s1 = min(n_frames, s0 + chunk_size)
+        pad_pre = max(0, s0 - 38)
+        pre_len = s0 - pad_pre
+        px_pad = px_m[pad_pre:s1]
+        py_pad = py_m[pad_pre:s1]
+        bx_pad_raw = ball_x_m[pad_pre:s1]
+        by_pad_raw = ball_y_m[pad_pre:s1]
+        b_vis_pad = np.isfinite(bx_pad_raw) & np.isfinite(by_pad_raw)
+        bx_pad = ball_x_smooth[pad_pre:s1]
+        by_pad = ball_y_smooth[pad_pre:s1]
+        d_pad = np.hypot(bx_pad[:, None] - px_pad, by_pad[:, None] - py_pad)
+        touch_22_pad = np.isfinite(px_pad) & b_vis_pad[:, None] & (d_pad <= 2.25)
+
+        # Past-38f sliding cumulative count for each slot & past ball visibility count
+        cs_t = np.vstack([np.zeros((1, n_slots), dtype=np.int32), np.cumsum(touch_22_pad, axis=0, dtype=np.int32)])
+        cs_vis = np.concatenate(([0], np.cumsum(b_vis_pad.astype(np.int32))))
+        loc_idx = np.arange(pre_len, pre_len + (s1 - s0))
+        lo_win = np.maximum(0, loc_idx - 38)
+        slot_touched_38 = (cs_t[loc_idx + 1] - cs_t[lo_win]) > 0
+        had_ball_hist = (cs_vis[loc_idx] - cs_vis[lo_win]) >= 3
+
+        px = px_m[s0:s1]
+        py = py_m[s0:s1]
+        vx = np.nan_to_num(vx_ms[s0:s1], nan=0.0)
+        vy = np.nan_to_num(vy_ms[s0:s1], nan=0.0)
+
+        bx_raw = ball_x_m[s0:s1]
+        by_raw = ball_y_m[s0:s1]
+        b_vis = np.isfinite(bx_raw) & np.isfinite(by_raw)
+        bx = ball_x_smooth[s0:s1]
+        by = ball_y_smooth[s0:s1]
+
+        valid = np.isfinite(px) & np.isfinite(py)
+        vh_all = valid & h_all[None, :]
+        va_all = valid & a_all[None, :]
+        vh_out = valid & h_out[None, :]
+        va_out = valid & a_out[None, :]
+
+        # --- A. Ball-Free Occupancy & Anisotropic Pitch Control (Camera & Ball) ---
+        h2_c = is_h2[s0:s1, None]
+        x_att_h = np.where(h2_c, pitch_length - px, px)  # + toward Away goal
+        box_occ_h[s0:s1] = np.sum(vh_out & (x_att_h >= pitch_length - 25.0), axis=1)
+        box_occ_a[s0:s1] = np.sum(va_out & (x_att_h <= 25.0), axis=1)
+        att_third_h = np.sum(vh_out & (x_att_h >= 0.66 * pitch_length), axis=1)
+        att_third_a = np.sum(va_out & (x_att_h <= 0.34 * pitch_length), axis=1)
+        att_third_occ_diff[s0:s1] = att_third_h - att_third_a
+
+        pc_cam = compute_anisotropic_pitch_control(
+            cam_x_smooth[s0:s1], cam_y_smooth[s0:s1], px, py, vx, vy, team_of_track
+        )
+        pc_cam_log_odds[s0:s1] = np.clip(pc_cam["pitch_control_log_odds"], -5.0, 5.0)
+        pc_ball = compute_anisotropic_pitch_control(bx, by, px, py, vx, vy, team_of_track)
+        pc_ball_log_odds[s0:s1] = np.clip(pc_ball["pitch_control_log_odds"], -5.0, 5.0)
+
+        # --- B. Time-to-Intercept & Open-Space Knock-On Carrying ---
+        # Distances from all players to current ball (use smoothed ball, gate carries on b_vis)
+        dx_b = bx[:, None] - px
+        dy_b = by[:, None] - py
+        dist_b = np.hypot(dx_b, dy_b)
+        dh_sort = np.sort(np.where(vh_all, dist_b, 1e6), axis=1)
+        da_sort = np.sort(np.where(va_all, dist_b, 1e6), axis=1)
+        dh1 = dh_sort[:, 0]
+        dh2 = dh_sort[:, 1]
+        da1 = da_sort[:, 0]
+        da2 = da_sort[:, 1]
+
+        row_loc = np.arange(s1 - s0)
+        sh_i = np.argmin(np.where(vh_all, dist_b, 1e6), axis=1)
+        sa_i = np.argmin(np.where(va_all, dist_b, 1e6), axis=1)
+
+        # TTI race to predicted ball landing point (bpx, bpy)
+        dx_p = bpx[s0:s1, None] - px
+        dy_p = bpy[s0:s1, None] - py
+        dp = np.hypot(dx_p, dy_p)
+        u_px = dx_p / np.maximum(dp, 0.25)
+        u_py = dy_p / np.maximum(dp, 0.25)
+        v_along_p = np.maximum(0.0, vx * u_px + vy * u_py)
+        tti_all = np.where(valid, dp / (3.2 + 0.85 * v_along_p) + 0.08, 20.0)
+        tti_h_min = np.min(np.where(vh_all, tti_all, 20.0), axis=1)
+        tti_a_min = np.min(np.where(va_all, tti_all, 20.0), axis=1)
+        tti_margin_ha[s0:s1] = np.clip((tti_a_min - tti_h_min) / 1.5, -2.0, 2.0)
+
+        # Evaluate knock-on & space-ahead kinematics symmetrically for Home (0) and Away (1)
+        vbx = vb_x_smooth[s0:s1]
+        vby = vb_y_smooth[s0:s1]
+        vb = v_ball_smooth[s0:s1]
+
+        for tm_idx, c_slot, own_mask, own_d1, own_d2, opp_d1, tti_own, tti_opp, opp_mask, att_dir, out_ko, out_oc, out_sa in [
+            (0, sh_i, vh_all, dh1, dh2, da1, tti_h_min, tti_a_min, va_all, np.where(is_h2[s0:s1], -1.0, 1.0), knock_on_h, open_carry_h, space_ahead_h),
+            (1, sa_i, va_all, da1, da2, dh1, tti_a_min, tti_h_min, vh_all, np.where(is_h2[s0:s1], 1.0, -1.0), knock_on_a, open_carry_a, space_ahead_a),
+        ]:
+            cvx = vx[row_loc, c_slot]
+            cvy = vy[row_loc, c_slot]
+            c_spd = np.hypot(cvx, cvy)
+            r_cb_x = bx - np.nan_to_num(px[row_loc, c_slot], nan=bx)
+            r_cb_y = by - np.nan_to_num(py[row_loc, c_slot], nan=by)
+            r_cb_d = np.hypot(r_cb_x, r_cb_y) + 1e-6
+
+            cos_chase = (cvx * r_cb_x + cvy * r_cb_y) / (c_spd * r_cb_d + 1e-6)
+            cos_bdir = (cvx * vbx + cvy * vby) / (c_spd * vb + 1e-6)
+
+            # Origin check: carrier slot ITSELF must have come within <=2.25m of seen ball
+            # in the last 38 frames (when visible-ball history exists) to count as a knock-on carry;
+            # prevents an opponent presser chasing someone else's long pass from faking a dribble!
+            c_touched = slot_touched_38[row_loc, c_slot]
+            origin_ok = (~had_ball_hist) | c_touched
+
+            # Space ahead along ball motion (or attacking direction when ball is slow)
+            dir_x = np.where(vb > 2.5, vbx / np.maximum(vb, 1e-6), att_dir)
+            dir_y = np.where(vb > 2.5, vby / np.maximum(vb, 1e-6), 0.0)
+            ox_b = px - bx[:, None]
+            oy_b = py - by[:, None]
+            proj_b = ox_b * dir_x[:, None] + oy_b * dir_y[:, None]
+            perp_b = np.abs(-ox_b * dir_y[:, None] + oy_b * dir_x[:, None])
+            in_front = opp_mask & (proj_b > 0.0) & (perp_b <= 5.5 + 0.35 * proj_b)
+            sa_vals = np.min(np.where(in_front, np.maximum(proj_b, 0.0), 35.0), axis=1)
+            out_sa[s0:s1] = sa_vals
+
+            ko_m = (
+                b_vis
+                & origin_ok
+                & (own_d1 >= 1.4)
+                & (own_d1 <= 7.0)
+                & (opp_d1 >= np.maximum(3.2, own_d1 + 1.1))
+                & (own_d2 >= own_d1 + 1.6)
+                & (c_spd >= 2.8)
+                & (cos_chase > 0.50)
+                & (cos_bdir > 0.42)
+                & (vb >= 2.5)
+                & (vb <= 19.0)
+                & ((tti_opp - tti_own) >= 0.08)
+            )
+            out_ko[s0:s1] = ko_m
+            # Continuous open-carry score combines close open dribble + knock-on carry (gated when far without origin)
+            touch_or_close = np.where((own_d1 <= 2.4) | origin_ok, 1.0, 0.25)
+            oc_score = (
+                b_vis.astype(np.float64)
+                * touch_or_close
+                * np.exp(-0.5 * (np.maximum(own_d1 - 1.5, 0.0) / 3.2) ** 2)
+                * _sigmoid_arr((opp_d1 - np.maximum(3.2, own_d1 + 0.8)) / 1.0)
+                * _sigmoid_arr((c_spd - 2.6) / 0.9)
+                * np.clip(0.5 + 0.5 * np.maximum(cos_bdir, cos_chase), 0.0, 1.0)
+                * np.clip(sa_vals / 12.0, 0.25, 1.0)
+            )
+            out_oc[s0:s1] = np.where(ko_m, np.maximum(oc_score, 0.72), oc_score)
+
+        # --- C. Shooting Range, Goal-Cone Blockers & Shot Flight ---
+        for gx_loc, d_gl, opp_mask, opp_d1, out_cone, out_takeon, out_crowd in [
+            (gx_h[s0:s1], d_goal_h[s0:s1], va_all, da1, n_def_cone_h, shot_takeon_open_h, shot_crowded_risk_h),
+            (gx_a[s0:s1], d_goal_a[s0:s1], vh_all, dh1, n_def_cone_a, shot_takeon_open_a, shot_crowded_risk_a),
+        ]:
+            dxg = gx_loc - bx
+            dyg = gy - by
+            dist_g = np.hypot(dxg, dyg) + 1e-6
+            ugx = dxg / dist_g
+            ugy = dyg / dist_g
+
+            ox = px - bx[:, None]
+            oy = py - by[:, None]
+            proj_g = ox * ugx[:, None] + oy * ugy[:, None]
+            perp_g = np.abs(-ox * ugy[:, None] + oy * ugx[:, None])
+            half_w = 1.6 + 3.0 * np.clip(proj_g / dist_g[:, None], 0.0, 1.0)
+            in_cone = opp_mask & (proj_g > 0.2) & (proj_g < dist_g[:, None]) & (perp_g <= half_w)
+            nc = np.sum(in_cone, axis=1).astype(np.float64)
+
+            in_zone = b_vis & (d_gl <= 28.0) & (np.abs(by - gy) <= 20.0)
+            out_cone[s0:s1] = np.where(in_zone, nc, 0.0)
+            out_takeon[s0:s1] = np.where(
+                in_zone,
+                np.exp(-0.5 * (np.maximum(nc - 1.0, 0.0) / 1.1) ** 2) * _sigmoid_arr((opp_d1 - 2.6) / 0.8),
+                0.0,
+            )
+            out_crowd[s0:s1] = np.where(
+                in_zone,
+                np.clip(0.5 * _sigmoid_arr((nc - 2.2) / 0.8) + 0.5 * _sigmoid_arr((2.4 - opp_d1) / 0.7), 0.0, 1.0),
+                0.0,
+            )
+
+        # High-velocity shot flight toward either goal inside shooting range
+        dxgh, dygh = gx_h[s0:s1] - bx, gy - by
+        v_to_h = (vbx * dxgh + vby * dygh) / np.maximum(np.hypot(dxgh, dygh), 1.0)
+        dxga, dyga = gx_a[s0:s1] - bx, gy - by
+        v_to_a = (vbx * dxga + vby * dyga) / np.maximum(np.hypot(dxga, dyga), 1.0)
+        v_to_goal = np.where(d_goal_h[s0:s1] <= d_goal_a[s0:s1], v_to_h, v_to_a)
+        shot_flight[s0:s1] = (
+            b_vis
+            & (np.minimum(d_goal_h[s0:s1], d_goal_a[s0:s1]) <= 28.0)
+            & (vb >= 13.5)
+            & (v_to_goal >= 9.0)
+        )
+
+    return {
+        "tti_margin_ha": tti_margin_ha,
+        "knock_on_h": knock_on_h,
+        "knock_on_a": knock_on_a,
+        "open_carry_h": open_carry_h,
+        "open_carry_a": open_carry_a,
+        "space_ahead_h": space_ahead_h,
+        "space_ahead_a": space_ahead_a,
+        "d_goal_h": d_goal_h,
+        "d_goal_a": d_goal_a,
+        "n_def_cone_h": n_def_cone_h,
+        "n_def_cone_a": n_def_cone_a,
+        "shot_takeon_open_h": shot_takeon_open_h,
+        "shot_takeon_open_a": shot_takeon_open_a,
+        "shot_crowded_risk_h": shot_crowded_risk_h,
+        "shot_crowded_risk_a": shot_crowded_risk_a,
+        "shot_flight": shot_flight,
+        "box_occ_h": box_occ_h,
+        "box_occ_a": box_occ_a,
+        "att_third_occ_diff": att_third_occ_diff,
+        "pc_ball_log_odds": pc_ball_log_odds,
+        "pc_cam_log_odds": pc_cam_log_odds,
+    }

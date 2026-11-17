@@ -18,15 +18,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--out",
-        default=os.path.join(ROOT, "evaluation", "results", "pressing_pinning_hybrid.csv"),
+        default=os.path.join(ROOT, "evaluation", "results", "branch_to_submit.csv"),
         help="Output submission CSV path",
     )
     parser.add_argument("--data-dir", default=None, help="Optional data directory override")
     args = parser.parse_args()
 
     print(
-        "Running 4-Stage Pressing-Pinning Full-ATD Hybrid Pipeline "
-        "(Matrix 9 Pin/Press + Control Physics + OOF Specialist ML + Reception Decoder)..."
+        "Running 4-Stage Final Hybrid Pipeline "
+        "(GK Re-ID Clean + Matrix 9/10 Carry & Shot Physics + Dual XGB/HGB + Path-CRF Viterbi)..."
     )
     result = run_sentiment_hybrid_pipeline(data_dir=args.data_dir, out_csv=args.out)
     labels = result["labels"]
@@ -41,10 +41,12 @@ def main():
     counts = {lbl: int(np.sum(labels == lbl)) for lbl in ("H", "A", "D", "X")}
     auc_nb = cv.get("oof_ha_auc_noball")
     auc_str = f" (AUC={auc_nb:.4f})" if auc_nb is not None else ""
+    b_auc = rt.get("oof_boundary_auc")
+    b_str = f" | PathCRF AUC={b_auc:.4f}" if b_auc is not None else ""
     print(
         f"Specialist Live CV -> GBDT_Full: {100*cv['oof_ha_acc_full']:.2f}% "
         f"(DuelStress={100*cv['oof_ha_acc_duel_stress']:.2f}%) | "
-        f"GBDT_NoBall(44-inv): {100*cv['oof_ha_acc_noball']:.2f}%{auc_str} | "
+        f"GBDT_NoBall(64-inv): {100*cv['oof_ha_acc_noball']:.2f}%{auc_str}{b_str} | "
         f"OOF Meta LogLoss={rt['oof_meta_logloss']:.4f}"
     )
     print(

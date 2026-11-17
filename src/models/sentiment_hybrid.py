@@ -224,6 +224,8 @@ def fuse_models_by_match_sentiment(
     oof_ha_noball,
     seq_log_probs,
     spec_cv_metrics=None,
+    p_boundary=None,
+    boundary_metrics=None,
 ):
     """Dynamically fuse Physics and ML predictions via Match Sentiment Psi_t & Flick Tactical Priors.
 
@@ -336,16 +338,26 @@ def fuse_models_by_match_sentiment(
     probs /= np.sum(probs, axis=1, keepdims=True)
     hybrid_log_probs = np.log(probs)
 
-    # 6. Directed Asymmetric Turnover Gates modulated by Sentiment + Matrix 9 Pinning/Press + In-Flight Hold
+    # 6. Directed Asymmetric Turnover Gates modulated by Sentiment + Matrix 9/10 + Path-CRF Edge
     base_gate = np.clip(
         0.85 + 0.42 * psi_chaos + 0.28 * psi_tempo - 0.28 * psi_tripod,
         0.62,
         1.48,
     )
+    knock_on_any = features.get("knock_on_any", np.zeros(n, dtype=bool))
+    shot_flight = features.get("shot_flight", np.zeros(n, dtype=bool))
     if has_full_atd:
-        base_gate = np.where(in_flight, base_gate * 0.55, base_gate)
+        # Hold aerial pass flights AND open-space knock-on dribbles steady; release on true shots!
+        base_gate = np.where(shot_flight, base_gate * 1.32, base_gate)
+        base_gate = np.where(in_flight & (~shot_flight), base_gate * 0.55, base_gate)
+        base_gate = np.where(knock_on_any, base_gate * 0.55, base_gate)
     # In contested missing-ball handovers, slightly ease transitions so NoBall can locate handover
     base_gate = np.where(contested_occl, np.maximum(base_gate, 1.18), base_gate)
+
+    if p_boundary is not None:
+        crf_edge_mult = np.clip(0.94 + 0.46 * p_boundary, 0.94, 1.40)
+    else:
+        crf_edge_mult = 1.0
 
     if has_full_atd:
         pr_h = features["press_cap_on_h"]
@@ -354,28 +366,42 @@ def fuse_models_by_match_sentiment(
         bait_a = features["bait_safety_a"]
         pin_a = features["pin_mean_a"]
         pin_h = features["pin_mean_h"]
-        m9_ha = np.clip(1.0 + 0.40 * (pr_h - 0.40) - 0.45 * (bait_h - 0.28) - 0.18 * pin_a, 0.65, 1.55)
-        m9_ah = np.clip(1.0 + 0.40 * (pr_a - 0.35) - 0.45 * (bait_a - 0.25) - 0.18 * pin_h, 0.65, 1.55)
+        stk_h = features.get("shot_takeon_open_h", np.zeros(n))
+        stk_a = features.get("shot_takeon_open_a", np.zeros(n))
+        scr_h = features.get("shot_crowded_risk_h", np.zeros(n))
+        scr_a = features.get("shot_crowded_risk_a", np.zeros(n))
+        m9_ha = np.clip(
+            1.0 + 0.40 * (pr_h - 0.40) - 0.45 * (bait_h - 0.28) - 0.18 * pin_a + 0.30 * scr_h - 0.22 * stk_h,
+            0.60,
+            1.65,
+        )
+        m9_ah = np.clip(
+            1.0 + 0.40 * (pr_a - 0.35) - 0.45 * (bait_a - 0.25) - 0.18 * pin_h + 0.30 * scr_a - 0.22 * stk_a,
+            0.60,
+            1.65,
+        )
     else:
         m9_ha = 1.0
         m9_ah = 1.0
 
-    # Flick counter-press & high-retention stability + Matrix 9 pinning safety guard against noise turnovers
+    # Flick counter-press & high-retention stability + Path-CRF & Matrix 9/10 directional gating
     break_guard = 1.0 - psi_counter_break_a
     turnover_gate_ha = np.clip(
         base_gate
+        * crf_edge_mult
         * m9_ha
         * (1.0 - 0.10 * ret_h * break_guard - 0.06 * psi_high_press)
         * (1.0 + 0.20 * psi_counter_break_a),
-        0.45,
-        1.70,
+        0.42,
+        1.75,
     )
     turnover_gate_ah = np.clip(
         base_gate
+        * crf_edge_mult
         * m9_ah
         * (1.0 + 0.10 * psi_high_press - 0.08 * psi_counter_break_a),
-        0.45,
-        1.70,
+        0.42,
+        1.75,
     )
 
     dom = sentiment["dominant_sentiment"]
@@ -392,6 +418,7 @@ def fuse_models_by_match_sentiment(
         "meta_w_noball_in_ml": meta["w_noball_in_ml"],
         "meta_beta_flick_prior": meta["beta_flick_prior"],
         "oof_meta_logloss": meta["oof_meta_logloss"],
+        "oof_boundary_auc": boundary_metrics.get("oof_boundary_auc") if boundary_metrics else None,
     }
 
     return hybrid_log_probs, turnover_gate_ha, turnover_gate_ah, logit_fused, routing_summary

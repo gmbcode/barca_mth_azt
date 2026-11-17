@@ -9,7 +9,11 @@ ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.physics_matrices import compute_press_and_pinning_matrices  # noqa: E402
+from src.physics_matrices import (  # noqa: E402
+    clean_atd_trajectories,
+    compute_carry_and_shooting_matrices,
+    compute_press_and_pinning_matrices,
+)
 from src.features import extract_physics_feature_dict  # noqa: E402
 from src.models.heuristic_fsm import compute_tier1_emission_log_probs, detect_physical_regimes  # noqa: E402
 from src.models.sentiment_hybrid import compute_match_sentiment_tensor, fuse_models_by_match_sentiment  # noqa: E402
@@ -144,8 +148,8 @@ def test_dual_mode_fallback_without_atd():
     }
 
     feats = extract_physics_feature_dict(stage1, st_priors)
-    assert feats["X_noball_inv"].shape == (n, 44)
-    assert feats["X_ctrl_atd"].shape == (n, 13)
+    assert feats["X_noball_inv"].shape == (n, 64)
+    assert feats["X_ctrl_atd"].shape == (n, 25)
     reg = detect_physical_regimes(feats, stage1["half_blocks"], split_contested_occl=True)
     t1 = compute_tier1_emission_log_probs(feats, reg)
     sent = compute_match_sentiment_tensor(feats, reg)
@@ -159,7 +163,99 @@ def test_dual_mode_fallback_without_atd():
     assert set(np.unique(labels)).issubset({"H", "A", "D", "X"})
 
 
+def test_gk_cleaning_carry_and_shooting_matrices():
+    """Verify GK wrong-end masking, open-space knock-on carry TTI, shooting-cone risk, and H2 symmetry."""
+    n_frames, n_slots = 4, 46
+    px = np.full((n_frames, n_slots), np.nan, dtype=np.float64)
+    py = np.full((n_frames, n_slots), np.nan, dtype=np.float64)
+    vx = np.zeros((n_frames, n_slots), dtype=np.float64)
+    vy = np.zeros((n_frames, n_slots), dtype=np.float64)
+    team = np.array([0] * 24 + [1] * 22, dtype=np.int8)
+
+    # Check GK swap masking at frame 0 (H1): slot 23 at x=100.9 (wrong box) should be NaN-masked,
+    # while real Home outfielder stays valid!
+    px[:, 1], py[:, 1] = 10.0, 34.0
+    px[0, 23], py[0, 23] = 100.9, 38.0
+    px[1, 23], py[1, 23] = 9.5, 34.0
+    px_cl, py_cl, _, _ = clean_atd_trajectories(
+        px, py, team, gk_slots=(23, 45), half_split_frame=2, pitch_length=105.3
+    )
+    assert np.isnan(px_cl[0, 23]), "Wrong-end Home GK in H1 must be masked"
+    assert np.isclose(px_cl[1, 23], 9.5), "Valid Home GK in own box must be preserved"
+
+    # Matrix 10 checks:
+    # Frame 0 (H1): Home winger knocking ball 3.5m ahead in open space, sprinting toward ball!
+    # Frame 1 (H1): Shooting zone (x=88, y=34) with crowded Away cone (4 blockers + close defender) vs
+    # Frame 2 (H1): Shooting zone (x=88, y=34) with open lane (1 GK only, no defender <4m) + shot speed
+    # Frame 3 (H2, frame >= half_split_frame=3): Exact H2 mirror of Frame 0!
+    px = np.full((n_frames, n_slots), np.nan, dtype=np.float64)
+    py = np.full((n_frames, n_slots), np.nan, dtype=np.float64)
+    vx = np.zeros((n_frames, n_slots), dtype=np.float64)
+    vy = np.zeros((n_frames, n_slots), dtype=np.float64)
+
+    bx = np.array([53.5, 88.0, 88.0, 105.3 - 53.5], dtype=np.float64)
+    by = np.array([34.0, 34.0, 34.0, 34.0], dtype=np.float64)
+    vbx = np.array([8.0, 2.0, 18.0, -8.0], dtype=np.float64)
+    vby = np.zeros(n_frames, dtype=np.float64)
+    vb = np.hypot(vbx, vby)
+
+    # Frame 0: knock-on carry by Home slot 1
+    px[0, 1], py[0, 1], vx[0, 1] = 50.0, 34.0, 6.5
+    px[0, 2], py[0, 2] = 35.0, 20.0
+    px[0, 24], py[0, 24] = 62.0, 34.0
+
+    # Frame 1: crowded shooting zone
+    px[1, 1], py[1, 1] = 87.5, 34.0
+    for j, ox, oy in [(24, 89.2, 34.0), (25, 92.0, 33.5), (26, 95.0, 34.8), (45, 102.0, 34.0)]:
+        px[1, j], py[1, j] = ox, oy
+
+    # Frame 2: open shooting lane with fast shot
+    px[2, 1], py[2, 1] = 87.5, 34.0
+    px[2, 45], py[2, 45] = 102.0, 34.0
+    px[2, 24], py[2, 24] = 82.0, 18.0
+
+    # Frame 3: exact mirror of Frame 0 in H2
+    for s in (1, 2, 24):
+        px[3, s] = 105.3 - px[0, s]
+        py[3, s] = py[0, s]
+        vx[3, s] = -vx[0, s]
+
+    m10 = compute_carry_and_shooting_matrices(
+        px, py, vx, vy, team, bx, by, bx, by, vbx, vby, vb, bx, by,
+        pitch_length=105.3, pitch_width=68.0, half_split_frame=3, gk_slots=(23, 45)
+    )
+    assert m10["knock_on_h"][0], "Open-space sprint knock-on should set knock_on_h"
+    assert m10["tti_margin_ha"][0] > 0.3, "Sprinter chasing knock-on must have positive TTI margin"
+    assert m10["shot_crowded_risk_h"][1] > m10["shot_crowded_risk_h"][2], "Crowded cone must elevate risk"
+    assert m10["shot_takeon_open_h"][2] > m10["shot_takeon_open_h"][1], "Open shooting lane must raise takeon_open"
+    assert m10["shot_flight"][2], "Fast shot inside 28m toward goal should trigger shot_flight"
+    assert np.isclose(m10["tti_margin_ha"][0], m10["tti_margin_ha"][3], atol=1e-6)
+    assert np.isclose(m10["open_carry_h"][0], m10["open_carry_h"][3], atol=1e-6)
+
+    # Verify opponent presser chasing a long Home pass never triggers false knock_on_a when
+    # Home had recent ball contact (t=0..4) and Away never came within <=2.25m!
+    T = 12
+    px_p = np.full((T, n_slots), np.nan, dtype=np.float64)
+    py_p = np.full((T, n_slots), np.nan, dtype=np.float64)
+    vx_p = np.zeros((T, n_slots), dtype=np.float64)
+    vy_p = np.zeros((T, n_slots), dtype=np.float64)
+    bx_p = np.linspace(10.0, 26.0, T)
+    by_p = np.full(T, 34.0)
+    vbx_p = np.full(T, 8.0)
+    vby_p = np.zeros(T)
+    vb_p = vbx_p.copy()
+    px_p[:5, 1], py_p[:5, 1] = bx_p[:5] - 0.5, 34.0  # Home launcher in [0..4]
+    px_p[5:, 1], py_p[5:, 1] = 15.0, 34.0
+    px_p[:, 24], py_p[:, 24], vx_p[:, 24] = bx_p - 4.0, 34.0, 6.5  # Away presser sprinting behind pass
+    m10_p = compute_carry_and_shooting_matrices(
+        px_p, py_p, vx_p, vy_p, team, bx_p, by_p, bx_p, by_p, vbx_p, vby_p, vb_p, bx_p, by_p,
+        pitch_length=105.3, pitch_width=68.0, half_split_frame=100, gk_slots=(23, 45)
+    )
+    assert not np.any(m10_p["knock_on_a"][5:]), "Presser without prior team touch must not fire knock_on_a"
+
+
 if __name__ == "__main__":
     test_matrix9_pinning_cover_outlets_and_half_symmetry()
     test_dual_mode_fallback_without_atd()
+    test_gk_cleaning_carry_and_shooting_matrices()
     print("ALL_TESTS_PASS")

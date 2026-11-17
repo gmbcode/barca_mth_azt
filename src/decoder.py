@@ -171,6 +171,9 @@ def _filter_sentiment_deflections(
     block_a_ball=None,
     block_st=None,
     has_full_atd=False,
+    block_ko=None,
+    block_shot=None,
+    block_tti=None,
 ):
     """Sentiment-aware deflection filter & reception/inflection snapper operating on Viterbi path."""
     codes = block_codes.copy()
@@ -319,12 +322,14 @@ def _filter_sentiment_deflections(
                 mean_vx_k = float(np.mean(block_vx_attack[s_r:e_r])) * dir_sign
                 mean_ev_k = float(np.mean(block_logit[s_r:e_r])) * dir_sign
 
-                # Genuine clean breakaway / sustained control protection (32..61f)
+                # Genuine clean breakaway / sustained control / knock-on sprint protection (32..61f)
+                mean_ko = float(np.mean(block_ko[s_r:e_r])) if block_ko is not None else 0.0
                 clean_break_protect = (
                     dur >= 34
-                    and mean_chaos < 0.42
-                    and mean_vx_k > 1.10
-                    and mean_ev_k > 1.65
+                    and (
+                        (mean_chaos < 0.42 and mean_vx_k > 1.10 and mean_ev_k > 1.65)
+                        or (mean_ko >= 0.25 and mean_ev_k > 1.25)
+                    )
                 )
 
                 calm_speed_ok = (mean_v < 1.15) if mean_chaos > 0.70 else (mean_v < 1.40)
@@ -353,7 +358,7 @@ def _filter_sentiment_deflections(
                     break
 
     if has_full_atd and block_dh1 is not None and block_da1 is not None:
-        # Pass 2C: Physical Reception & Clearance-Kick Forward Boundary Snapper
+        # Pass 2C: Physical Reception, Shot-Flight & Knock-On-Safe Boundary Snapper
         runs = _runs(codes)
         for i in range(1, len(runs)):
             t_trans = runs[i][0]
@@ -373,8 +378,21 @@ def _filter_sentiment_deflections(
                 if block_st is not None
                 else np.zeros(w_len, dtype=np.float64)
             )
+            # If new_team is already executing an open-space knock-on carry with TTI margin, keep boundary
+            ko_active_start = (
+                block_ko is not None
+                and np.any(block_ko[t_trans:t_trans + min(8, w_len)])
+                and (
+                    block_tti is None
+                    or float(np.mean(block_tti[t_trans:t_trans + min(8, w_len)]) * (1.0 if new_team == 0 else -1.0)) > 0.10
+                )
+            )
+            if ko_active_start:
+                continue
+
+            is_shot_start = block_shot is not None and np.any(block_shot[t_trans:t_trans + min(6, w_len)])
             best_k = None
-            if vb_s[0] > 9.5 or dn_s[0] > 2.3:
+            if is_shot_start or vb_s[0] > 9.5 or dn_s[0] > 2.3:
                 k_vmax = int(np.argmax(vb_s[:min(22, w_len)]))
                 v_ref = max(float(vb_s[k_vmax]), 12.0)
                 for k in range(max(1, k_vmax), min(36, w_len)):
@@ -391,7 +409,7 @@ def _filter_sentiment_deflections(
             if best_k is not None and 3 <= best_k <= 36:
                 codes[t_trans:t_trans + best_k] = prev_team
 
-        # Pass 3B: Full-ATD Ball-Control Deflection & Pre-Dead Exit Filter
+        # Pass 3B: Full-ATD Ball-Control Deflection & Pre-Dead Exit Filter (protect knock-on carries!)
         changed = True
         while changed:
             changed = False
@@ -408,6 +426,9 @@ def _filter_sentiment_deflections(
                         and (next_dur >= 45 or (i == len(runs) - 2 and next_dur >= 8))
                         and dur < 68
                     ):
+                        mean_ko = float(np.mean(block_ko[s_r:e_r])) if block_ko is not None else 0.0
+                        if mean_ko >= 0.15:
+                            continue
                         dk = (block_dh1 if k_r == 0 else block_da1)[s_r:e_r]
                         p25d = float(np.percentile(dk, 25))
                         st_opp = (
@@ -428,6 +449,7 @@ def _filter_sentiment_deflections(
             dur_last = e_last - s_last
             prev_dur = runs[-2][1] - runs[-2][0]
             if prev_dur >= 75 and dur_last < 58:
+                mean_ko = float(np.mean(block_ko[s_last:e_last])) if block_ko is not None else 0.0
                 dk = (block_dh1 if k_last == 0 else block_da1)[s_last:e_last]
                 p25d = float(np.percentile(dk, 25))
                 st_opp = (
@@ -435,7 +457,7 @@ def _filter_sentiment_deflections(
                     if block_st is not None
                     else 0.0
                 )
-                if p25d > 2.20 or st_opp <= -1.0:
+                if mean_ko < 0.15 and (p25d > 2.20 or st_opp <= -1.0):
                     codes[s_last:e_last] = runs[-2][2]
 
     return codes
@@ -480,6 +502,9 @@ def decode_sentiment_hybrid_match(
     v_ball = features.get("v_ball")
     a_ball = features.get("a_ball")
     st_net = features.get("st_net_log_odds")
+    ko_any = features.get("knock_on_any")
+    shot_fl = features.get("shot_flight")
+    tti_m = features.get("tti_margin_ha")
     code_to_str = np.array(["H", "A", "D"])
 
     for _, h_start, h_end_incl in half_blocks:
@@ -516,6 +541,9 @@ def decode_sentiment_hybrid_match(
                 block_a_ball=a_ball[abs_s:abs_e] if a_ball is not None else None,
                 block_st=st_net[abs_s:abs_e] if st_net is not None else None,
                 has_full_atd=has_full_atd,
+                block_ko=ko_any[abs_s:abs_e] if ko_any is not None else None,
+                block_shot=shot_fl[abs_s:abs_e] if shot_fl is not None else None,
+                block_tti=tti_m[abs_s:abs_e] if tti_m is not None else None,
             )
             half_codes[lr_s:lr_e] = refined_live
 

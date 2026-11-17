@@ -279,17 +279,17 @@ def fit_ball_dropout_gbdt_models(features, anchor_labels, graded_mask, n_blocks=
 
 
 def fit_sentiment_specialist_gbdt_models(
-    features, anchor_labels, graded_mask, regimes=None, n_blocks=6, stride=4, seed=42
+    features, anchor_labels, graded_mask, regimes=None, n_blocks=6, stride=3, seed=42
 ):
-    """Train binary {H, A} live-team specialist models (GBDT_Alive_Full & GBDT_Alive_NoBall).
+    """Train binary {H, A} live-team specialist ensembles (XGBoost + HistGBDT for Full & NoBall).
 
-    Uses clean + borderline live anchors alongside half-invariant trajectory kinematics (`X_noball_inv`)
-    and injects both Sim2Real ball-dropout (30%) and w=8 local flicker-inversion noise (20%) during
-    training so GBDT_Alive_Full breaks 100% raw memorization and generalizes into noisy duels.
+    Uses clean + borderline live anchors alongside half-invariant trajectory kinematics (`X_noball_inv`,
+    up to 58 ball-free features) and injects Sim2Real ball-dropout (30%) + w=8 flicker noise (15%)
+    during training so Full models generalize into noisy duels while Dual-Family GBDT variance drops.
     """
     X_full = features["X_full"]
     # Omit raw single-frame & centered sh_8/sh_20 shortcuts so GBDT_Alive_Full learns genuine
-    # multi-scale momentum, ball-control proximity X_ctrl_atd, and Matrix 5/9 kinematics X_noball_inv.
+    # multi-scale momentum, Matrix 10 carry/shot proximity X_ctrl_atd, and Matrix 5/9/10 X_noball_inv.
     keep_ball_cols = [3, 4, 5, 6, 7, 11, 12, 13, 17, 18, 19, 23]
     n_ball_cols = len(keep_ball_cols)
     if "X_noball_inv" in features:
@@ -370,28 +370,29 @@ def fit_sentiment_specialist_gbdt_models(
             ).astype(np.float32)
         return Xo
 
-    def _build_bin_clf(f_seed, is_nb):
-        if HAS_XGB:
-            return XGBClassifier(
-                n_estimators=140 if not is_nb else 150,
-                max_depth=4,
-                learning_rate=0.05,
-                subsample=0.80,
-                colsample_bytree=0.68 if not is_nb else 0.75,
-                min_child_weight=50 if not is_nb else 35,
-                reg_lambda=8.0 if not is_nb else 6.0,
-                reg_alpha=1.5 if not is_nb else 1.0,
-                objective="binary:logistic",
-                random_state=f_seed,
-                n_jobs=4,
-                verbosity=0,
-            )
-        return HistGradientBoostingClassifier(
-            max_iter=140 if not is_nb else 150,
-            max_depth=4,
+    def _build_xgb(f_seed, is_nb):
+        return XGBClassifier(
+            n_estimators=220 if is_nb else 180,
+            max_depth=5,
             learning_rate=0.05,
-            min_samples_leaf=50 if not is_nb else 35,
-            l2_regularization=8.0 if not is_nb else 6.0,
+            subsample=0.80,
+            colsample_bytree=0.65 if is_nb else 0.68,
+            min_child_weight=35 if is_nb else 45,
+            reg_lambda=8.0 if is_nb else 9.0,
+            reg_alpha=1.5,
+            objective="binary:logistic",
+            random_state=f_seed,
+            n_jobs=4,
+            verbosity=0,
+        )
+
+    def _build_hgb(f_seed, is_nb):
+        return HistGradientBoostingClassifier(
+            max_iter=170 if is_nb else 150,
+            max_depth=5,
+            learning_rate=0.05,
+            min_samples_leaf=35 if is_nb else 45,
+            l2_regularization=7.0 if is_nb else 8.0,
             random_state=f_seed,
         )
 
@@ -407,20 +408,37 @@ def fit_sentiment_specialist_gbdt_models(
         oof_pi_h_frame[va_all] = float(np.mean(y_tr == 0))
 
         X_tr_f = _corrupt_ball_duel_batch(X_alive_full[live_anchor_idx[tr_m]], rng, drop_p=0.30, flip_p=0.15)
-        clf_full = _build_bin_clf(seed + fold, is_nb=False)
-        clf_full.fit(X_tr_f, y_tr, sample_weight=w_tr)
-        oof_ha_full[va_all] = clf_full.predict_proba(X_alive_full[va_all])
         X_va_clean = X_alive_full[live_anchor_idx[va_m]]
-        oof_anc_full[va_m] = clf_full.predict_proba(X_va_clean)
-        # Honest validation under duel stress (w=8 flicker + dropout)
         X_va_noisy = _corrupt_ball_duel_batch(X_va_clean, rng, drop_p=0.25, flip_p=0.20)
-        oof_anc_noisy[va_m] = clf_full.predict_proba(X_va_noisy)
+
+        if HAS_XGB:
+            xgb_f = _build_xgb(seed + fold, is_nb=False)
+            hgb_f = _build_hgb(seed + 50 + fold, is_nb=False)
+            xgb_f.fit(X_tr_f, y_tr, sample_weight=w_tr)
+            hgb_f.fit(X_tr_f, y_tr, sample_weight=w_tr)
+            oof_ha_full[va_all] = 0.65 * xgb_f.predict_proba(X_alive_full[va_all]) + 0.35 * hgb_f.predict_proba(X_alive_full[va_all])
+            oof_anc_full[va_m] = 0.65 * xgb_f.predict_proba(X_va_clean) + 0.35 * hgb_f.predict_proba(X_va_clean)
+            oof_anc_noisy[va_m] = 0.65 * xgb_f.predict_proba(X_va_noisy) + 0.35 * hgb_f.predict_proba(X_va_noisy)
+        else:
+            hgb_f = _build_hgb(seed + fold, is_nb=False)
+            hgb_f.fit(X_tr_f, y_tr, sample_weight=w_tr)
+            oof_ha_full[va_all] = hgb_f.predict_proba(X_alive_full[va_all])
+            oof_anc_full[va_m] = hgb_f.predict_proba(X_va_clean)
+            oof_anc_noisy[va_m] = hgb_f.predict_proba(X_va_noisy)
 
         X_tr_nb = X_noball[live_anchor_idx[tr_m]]
-        clf_nb = _build_bin_clf(seed + 100 + fold, is_nb=True)
-        clf_nb.fit(X_tr_nb, y_tr, sample_weight=w_tr)
-        oof_ha_noball[va_all] = clf_nb.predict_proba(X_noball[va_all])
-        oof_anc_noball[va_m] = clf_nb.predict_proba(X_noball[live_anchor_idx[va_m]])
+        if HAS_XGB:
+            xgb_nb = _build_xgb(seed + 100 + fold, is_nb=True)
+            hgb_nb = _build_hgb(seed + 150 + fold, is_nb=True)
+            xgb_nb.fit(X_tr_nb, y_tr, sample_weight=w_tr)
+            hgb_nb.fit(X_tr_nb, y_tr, sample_weight=w_tr)
+            oof_ha_noball[va_all] = 0.65 * xgb_nb.predict_proba(X_noball[va_all]) + 0.35 * hgb_nb.predict_proba(X_noball[va_all])
+            oof_anc_noball[va_m] = 0.65 * xgb_nb.predict_proba(X_noball[live_anchor_idx[va_m]]) + 0.35 * hgb_nb.predict_proba(X_noball[live_anchor_idx[va_m]])
+        else:
+            hgb_nb = _build_hgb(seed + 100 + fold, is_nb=True)
+            hgb_nb.fit(X_tr_nb, y_tr, sample_weight=w_tr)
+            oof_ha_noball[va_all] = hgb_nb.predict_proba(X_noball[va_all])
+            oof_anc_noball[va_m] = hgb_nb.predict_proba(X_noball[live_anchor_idx[va_m]])
 
     oof_anc_full /= np.maximum(np.sum(oof_anc_full, axis=1, keepdims=True), 1e-12)
     oof_anc_noball /= np.maximum(np.sum(oof_anc_noball, axis=1, keepdims=True), 1e-12)
