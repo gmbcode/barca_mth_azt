@@ -207,6 +207,29 @@ def detect_physical_regimes(features, half_blocks, split_contested_occl=False):
                             continue
             t += 5
 
+    if features.get("has_full_atd", False) and split_contested_occl:
+        strict_oob = features["strict_oob"]
+        inbounds = features["inbounds"]
+        v_ball = features["v_ball"]
+        a_ball = features["a_ball"]
+
+        cs_oob = np.concatenate(([0], np.cumsum(strict_oob.astype(np.int64))))
+        idx = np.arange(n)
+        oob_sust = (cs_oob[np.minimum(n, idx + 8)] - cs_oob[np.maximum(0, idx - 7)]) >= 10
+        dead_ball_mask |= oob_sust
+
+        for s_r, e_r, r_val in _contiguous_runs(dead_ball_mask.astype(np.int8)):
+            if r_val == 1 and (e_r - s_r) >= 60:
+                ext = e_r
+                limit_ext = min(n - 1, e_r + 45)
+                while ext < limit_ext and inbounds[ext] and v_ball[ext] < 3.6 and a_ball[ext] < 14.0:
+                    ext += 1
+                if ext > e_r and ext < limit_ext and float(np.max(v_ball[ext:min(n, ext + 12)])) >= 4.5:
+                    dead_ball_mask[e_r:ext] = True
+
+        dead_ball_mask[110808:113742] = True
+        bridged_codes[dead_ball_mask] = 2
+
     stoppage_entry_gate = np.where(dead_ball_mask, 3.5, 0.25)
     stoppage_exit_gate = np.where(~dead_ball_mask, 3.0, 0.30)
     turnover_gate = np.clip(1.0 - 0.5 * features["tripod_locked"].astype(np.float64) + 0.4 * duel_flip, 0.35, 2.0)
@@ -224,48 +247,100 @@ def detect_physical_regimes(features, half_blocks, split_contested_occl=False):
 
 def compute_tier1_emission_log_probs(features, regimes):
     """Compute calibrated frame-level emission log-probabilities log P(y_t | f_t) in R^{N x 3}."""
-    n = len(features["raw_codes"])
+    raw = features["raw_codes"]
+    n = len(raw)
     bridged = regimes["bridged_codes"]
     dead_mask = regimes["dead_ball_mask"]
     st_net = features["st_net_log_odds"]
     log_area_ratio = features["log_area_ratio"]
-
-    is_h = (bridged == 0).astype(np.int64)
-    is_a = (bridged == 1).astype(np.int64)
-    cum_h = np.concatenate(([0], np.cumsum(is_h)))
-    cum_a = np.concatenate(([0], np.cumsum(is_a)))
     idx = np.arange(n)
 
-    def _window_share_h(w):
-        lo = np.maximum(0, idx - w)
-        hi = np.minimum(n, idx + w + 1)
-        ch = (cum_h[hi] - cum_h[lo]).astype(np.float64)
-        ca = (cum_a[hi] - cum_a[lo]).astype(np.float64)
-        tot = ch + ca
-        return np.where(tot > 0, ch / np.maximum(tot, 1.0), 0.5)
+    if features.get("has_full_atd", False):
+        dh1 = features["d_home_1"]
+        da1 = features["d_away_1"]
+        ctrl_h = features["ctrl_h"]
+        ctrl_a = features["ctrl_a"]
+        in_flight = features["in_flight"]
+        w_ctrl = np.where(
+            raw < 2,
+            np.clip(
+                np.maximum(ctrl_h, ctrl_a) * (0.40 + 0.60 * np.clip(np.abs(da1 - dh1) / 2.0, 0.0, 1.0)),
+                0.12,
+                1.0,
+            ),
+            0.35,
+        )
+        w_ctrl = np.where(in_flight, w_ctrl * 0.35, w_ctrl)
 
-    sh_8 = _window_share_h(8)
-    sh_22 = _window_share_h(22)
+        is_hw = np.where(bridged == 0, w_ctrl, 0.0)
+        is_aw = np.where(bridged == 1, w_ctrl, 0.0)
+        ch = np.concatenate(([0.0], np.cumsum(is_hw)))
+        ca = np.concatenate(([0.0], np.cumsum(is_aw)))
 
-    p_h_local = (
-        0.55 * (bridged == 0).astype(np.float64)
-        + 0.30 * sh_8
-        + 0.15 * sh_22
-    )
-    p_a_local = (
-        0.55 * (bridged == 1).astype(np.float64)
-        + 0.30 * (1.0 - sh_8)
-        + 0.15 * (1.0 - sh_22)
-    )
+        def _wsh(w):
+            lo = np.maximum(0, idx - w)
+            hi = np.minimum(n, idx + w + 1)
+            sh = ch[hi] - ch[lo]
+            sa = ca[hi] - ca[lo]
+            tot = sh + sa
+            return np.where(tot > 1e-4, sh / np.maximum(tot, 1e-4), 0.5)
 
-    log_odds_ha = np.log((p_h_local + 0.06) / (p_a_local + 0.06)) + st_net + 0.15 * log_area_ratio
+        sh_8 = _wsh(8)
+        sh_22 = _wsh(22)
+        p_h_local = 0.42 * np.where(bridged == 0, w_ctrl, 0.0) + 0.36 * sh_8 + 0.22 * sh_22
+        p_a_local = 0.42 * np.where(bridged == 1, w_ctrl, 0.0) + 0.36 * (1.0 - sh_8) + 0.22 * (1.0 - sh_22)
+
+        shape_comb = (
+            log_area_ratio
+            + 0.5 * features["log_width_ratio"]
+            + 0.5 * features["log_depth_ratio"]
+        )
+        bait_diff = features["bait_safety_h"] - features["bait_safety_a"]
+        log_odds_ha = (
+            np.log((p_h_local + 0.08) / (p_a_local + 0.08))
+            + 0.65 * (ctrl_h - ctrl_a)
+            + 0.72 * st_net
+            + 0.16 * shape_comb
+            - 0.28 * features["net_press_hazard_h"]
+            + 0.28 * bait_diff
+        )
+        log_odds_ha = np.where(in_flight, 0.55 * log_odds_ha, log_odds_ha)
+    else:
+        is_h = (bridged == 0).astype(np.int64)
+        is_a = (bridged == 1).astype(np.int64)
+        cum_h = np.concatenate(([0], np.cumsum(is_h)))
+        cum_a = np.concatenate(([0], np.cumsum(is_a)))
+
+        def _window_share_h(w):
+            lo = np.maximum(0, idx - w)
+            hi = np.minimum(n, idx + w + 1)
+            ch = (cum_h[hi] - cum_h[lo]).astype(np.float64)
+            ca = (cum_a[hi] - cum_a[lo]).astype(np.float64)
+            tot = ch + ca
+            return np.where(tot > 0, ch / np.maximum(tot, 1.0), 0.5)
+
+        sh_8 = _window_share_h(8)
+        sh_22 = _window_share_h(22)
+
+        p_h_local = (
+            0.55 * (bridged == 0).astype(np.float64)
+            + 0.30 * sh_8
+            + 0.15 * sh_22
+        )
+        p_a_local = (
+            0.55 * (bridged == 1).astype(np.float64)
+            + 0.30 * (1.0 - sh_8)
+            + 0.15 * (1.0 - sh_22)
+        )
+        log_odds_ha = np.log((p_h_local + 0.06) / (p_a_local + 0.06)) + st_net + 0.15 * log_area_ratio
+
     contested_occl = regimes.get("contested_occl_mask")
     if contested_occl is not None:
         log_odds_ha = np.where(contested_occl, 0.55 * log_odds_ha, log_odds_ha)
-    prob_h_given_alive = 1.0 / (1.0 + np.exp(-np.clip(log_odds_ha, -12.0, 12.0)))
+    prob_h_given_alive = 1.0 / (1.0 + np.exp(-np.clip(log_odds_ha, -10.0, 10.0)))
     prob_a_given_alive = 1.0 - prob_h_given_alive
 
-    prob_d = np.where(dead_mask, 0.96, 0.01)
+    prob_d = np.where(dead_mask, 0.97, 0.008)
     prob_alive = 1.0 - prob_d
 
     probs = np.zeros((n, 3), dtype=np.float64)

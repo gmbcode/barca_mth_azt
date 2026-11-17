@@ -373,10 +373,13 @@ def compute_team_spatial_inertia_tensors(px_m, py_m, team_of_track, gk_slots=(23
     def _team_tensor(mask):
         x = np.where(mask[None, :], px_m, np.nan)
         y = np.where(mask[None, :], py_m, np.nan)
-        cnt = np.sum(np.isfinite(x), axis=1)
+        valid_xy = np.isfinite(x) & np.isfinite(y)
+        cnt = np.sum(valid_xy, axis=1)
         safe_cnt = np.maximum(cnt, 1)
-        mx = np.nan_to_num(np.nanmean(x, axis=1), nan=52.65)
-        my = np.nan_to_num(np.nanmean(y, axis=1), nan=34.0)
+        sum_x = np.sum(np.where(valid_xy, x, 0.0), axis=1)
+        sum_y = np.sum(np.where(valid_xy, y, 0.0), axis=1)
+        mx = np.where(cnt > 0, sum_x / safe_cnt, 52.65)
+        my = np.where(cnt > 0, sum_y / safe_cnt, 34.0)
 
         dx = np.where(np.isfinite(x), x - mx[:, None], 0.0)
         dy = np.where(np.isfinite(y), y - my[:, None], 0.0)
@@ -603,3 +606,162 @@ def build_time_inhomogeneous_transition_matrices(
     A_t = A_t - log_sum_exp
 
     return A_t
+
+
+# ---------------------------------------------------------------------------
+# Matrix 9: Pressing Commitment, Defender Pinning & Blind-Side Risk Tensor
+# ---------------------------------------------------------------------------
+
+def compute_press_and_pinning_matrices(
+    px_m,
+    py_m,
+    vx_ms,
+    vy_ms,
+    team_of_track,
+    ball_x_m,
+    ball_y_m,
+    pitch_length=105.3,
+    half_split_frame=90652,
+    gk_slots=(23, 45),
+    sigma_mark_m=5.5,
+    chunk_size=4096,
+):
+    """Compute vectorized tactical pressing commitment & attacker-behind-defender pinning metrics.
+
+    A defender cannot safely jump to press the ball if jumping leaves an opponent attacker
+    unmarked on their goal-side / blind shoulder without cover behind.
+
+    Returns dict of (N,) float64 arrays:
+      - pin_mean_a / pin_mean_h      : Mean goal-side pinning load on nearby defenders in [0, 1]
+      - press_cap_on_h / press_cap_on_a : Unpinned closing-speed-weighted press pressure on carrier
+      - bait_safety_h / bait_safety_a : Fraction of nearby defender pressure neutralized by pinning
+      - n_free_outlets_h / _a         : Number of unguarded open passing outlets (4m+ separation)
+      - net_press_hazard_h            : Net turnover hazard favoring Away steal (+) vs Home hold (-)
+    """
+    n_frames, n_slots = px_m.shape
+    slot_idx = np.arange(n_slots)
+    is_gk = np.isin(slot_idx, gk_slots)
+    h_out = (team_of_track == 0) & (~is_gk)
+    a_out = (team_of_track == 1) & (~is_gk)
+
+    pin_mean_a = np.zeros(n_frames, dtype=np.float64)
+    pin_mean_h = np.zeros(n_frames, dtype=np.float64)
+    press_cap_on_h = np.zeros(n_frames, dtype=np.float64)
+    press_cap_on_a = np.zeros(n_frames, dtype=np.float64)
+    bait_safety_h = np.full(n_frames, 0.5, dtype=np.float64)
+    bait_safety_a = np.full(n_frames, 0.5, dtype=np.float64)
+    n_free_outlets_h = np.zeros(n_frames, dtype=np.float64)
+    n_free_outlets_a = np.zeros(n_frames, dtype=np.float64)
+
+    two_sig_sq = 2.0 * (sigma_mark_m ** 2)
+    two_cov_sq = 2.0 * (5.0 ** 2)
+
+    for s0 in range(0, n_frames, chunk_size):
+        s1 = min(n_frames, s0 + chunk_size)
+        px = px_m[s0:s1]
+        py = py_m[s0:s1]
+        vx = np.nan_to_num(vx_ms[s0:s1], nan=0.0)
+        vy = np.nan_to_num(vy_ms[s0:s1], nan=0.0)
+        bx = ball_x_m[s0:s1, None]
+        by = ball_y_m[s0:s1, None]
+
+        # Flip X in Half 2 so +x_att always points toward Away's goal
+        h2_mask = (np.arange(s0, s1) >= half_split_frame)[:, None]
+        x_att = np.where(h2_mask, pitch_length - px, px)
+
+        valid = np.isfinite(px) & np.isfinite(py)
+        vh = valid & h_out[None, :]
+        va = valid & a_out[None, :]
+
+        # Distance & closing speed toward ball
+        dbx = bx - px
+        dby = by - py
+        d_ball = np.hypot(dbx, dby)
+        u_bx = dbx / np.maximum(d_ball, 0.5)
+        u_by = dby / np.maximum(d_ball, 0.5)
+        v_close = np.maximum(0.0, vx * u_bx + vy * u_by)
+        w_ball_prox = np.where(valid, np.exp(-np.nan_to_num(d_ball, nan=1e3) / 6.5), 0.0)
+
+        # Pairwise distances (B, S, S) safely masked where invalid
+        px_s = np.nan_to_num(px, nan=1e4)
+        py_s = np.nan_to_num(py, nan=1e4)
+        dx_ij = px_s[:, :, None] - px_s[:, None, :]
+        dy_ij = py_s[:, :, None] - py_s[:, None, :]
+        d2_ij = dx_ij * dx_ij + dy_ij * dy_ij
+        x_att_s = np.nan_to_num(x_att, nan=0.0)
+
+        # --- Away defenders pinned by Home attackers behind them (x_att[k] > x_att[j] - 0.5) ---
+        # Cover on Home attacker k from OTHER Away defender m: x_att[m] > x_att[k] + 0.8 (implies m != j)
+        h_goal_side_of_a = vh[:, None, :] & va[:, :, None] & (x_att_s[:, None, :] > (x_att_s[:, :, None] - 0.5))
+        cov_a_k = (
+            va[:, :, None]
+            & vh[:, None, :]
+            & (x_att_s[:, :, None] > (x_att_s[:, None, :] + 0.8))
+        )
+        cov_w_a = np.where(cov_a_k, np.exp(-d2_ij / two_cov_sq), 0.0)  # (B, m, k)
+        max_cov_on_k_by_a = np.max(cov_w_a, axis=1)  # (B, k)
+        pin_pair_a = np.where(
+            h_goal_side_of_a & (d2_ij < 144.0),
+            np.exp(-d2_ij / two_sig_sq) * (1.0 - 0.65 * max_cov_on_k_by_a[:, None, :]),
+            0.0,
+        )
+        pin_j_a = np.clip(np.max(pin_pair_a, axis=2), 0.0, 1.0)  # (B, j in Away)
+
+        # --- Home defenders pinned by Away attackers behind them (x_att[k] < x_att[j] + 0.5) ---
+        # Cover on Away attacker k from OTHER Home defender m: x_att[m] < x_att[k] - 0.8 (implies m != j)
+        a_goal_side_of_h = va[:, None, :] & vh[:, :, None] & (x_att_s[:, None, :] < (x_att_s[:, :, None] + 0.5))
+        cov_h_k = (
+            vh[:, :, None]
+            & va[:, None, :]
+            & (x_att_s[:, :, None] < (x_att_s[:, None, :] - 0.8))
+        )
+        cov_w_h = np.where(cov_h_k, np.exp(-d2_ij / two_cov_sq), 0.0)
+        max_cov_on_k_by_h = np.max(cov_w_h, axis=1)
+        pin_pair_h = np.where(
+            a_goal_side_of_h & (d2_ij < 144.0),
+            np.exp(-d2_ij / two_sig_sq) * (1.0 - 0.65 * max_cov_on_k_by_h[:, None, :]),
+            0.0,
+        )
+        pin_j_h = np.clip(np.max(pin_pair_h, axis=2), 0.0, 1.0)
+
+        # Nearby proximity weights (only pressers near ball zone)
+        wa_zone = np.where(va & (d_ball < 18.0), w_ball_prox, 0.0)
+        wh_zone = np.where(vh & (d_ball < 18.0), w_ball_prox, 0.0)
+
+        pin_mean_a[s0:s1] = np.sum(wa_zone * pin_j_a, axis=1) / np.maximum(np.sum(wa_zone, axis=1), 1e-3)
+        pin_mean_h[s0:s1] = np.sum(wh_zone * pin_j_h, axis=1) / np.maximum(np.sum(wh_zone, axis=1), 1e-3)
+
+        # Closing-speed weighted unpinned press capacity
+        eff_a = np.where(va, w_ball_prox * (1.0 - pin_j_a) * (0.35 + np.clip(v_close / 5.0, 0.0, 1.5)), 0.0)
+        eff_h = np.where(vh, w_ball_prox * (1.0 - pin_j_h) * (0.35 + np.clip(v_close / 5.0, 0.0, 1.5)), 0.0)
+        press_cap_on_h[s0:s1] = np.sum(eff_a, axis=1)
+        press_cap_on_a[s0:s1] = np.sum(eff_h, axis=1)
+
+        # Press-bait safety: fraction of nearby opponent pressure neutralized by pinning
+        raw_a_p = np.sum(wa_zone, axis=1)
+        raw_h_p = np.sum(wh_zone, axis=1)
+        bait_safety_h[s0:s1] = np.where(raw_a_p > 1e-3, np.sum(wa_zone * pin_j_a, axis=1) / (raw_a_p + 1e-3), 0.5)
+        bait_safety_a[s0:s1] = np.where(raw_h_p > 1e-3, np.sum(wh_zone * pin_j_h, axis=1) / (raw_h_p + 1e-3), 0.5)
+
+        # Open passing outlets: teammates 3m..35m from ball with >=4.0m min distance to nearest defender
+        d_ij = np.sqrt(np.maximum(d2_ij, 0.0))
+        min_opp_to_h = np.min(np.where(va[:, None, :], d_ij, np.inf), axis=2)  # (B, i)
+        min_opp_to_a = np.min(np.where(vh[:, None, :], d_ij, np.inf), axis=2)
+        h_outlets = vh & (d_ball >= 3.0) & (d_ball <= 35.0) & (min_opp_to_h >= 4.0)
+        a_outlets = va & (d_ball >= 3.0) & (d_ball <= 35.0) & (min_opp_to_a >= 4.0)
+        n_free_outlets_h[s0:s1] = np.sum(h_outlets, axis=1)
+        n_free_outlets_a[s0:s1] = np.sum(a_outlets, axis=1)
+
+    net_press_hazard_h = (press_cap_on_h - 0.85 * bait_safety_h) - (press_cap_on_a - 0.85 * bait_safety_a)
+
+    return {
+        "pin_mean_a": pin_mean_a,
+        "pin_mean_h": pin_mean_h,
+        "press_cap_on_h": press_cap_on_h,
+        "press_cap_on_a": press_cap_on_a,
+        "bait_safety_h": bait_safety_h,
+        "bait_safety_a": bait_safety_a,
+        "n_free_outlets_h": n_free_outlets_h,
+        "n_free_outlets_a": n_free_outlets_a,
+        "net_press_hazard_h": net_press_hazard_h,
+    }

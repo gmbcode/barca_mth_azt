@@ -159,9 +159,20 @@ def decode_full_match(log_emit, features, regimes, half_blocks):
 
 
 def _filter_sentiment_deflections(
-    block_codes, block_bridged, block_v_cam, block_chaos, block_logit, block_vx_attack
+    block_codes,
+    block_bridged,
+    block_v_cam,
+    block_chaos,
+    block_logit,
+    block_vx_attack,
+    block_dh1=None,
+    block_da1=None,
+    block_v_ball=None,
+    block_a_ball=None,
+    block_st=None,
+    has_full_atd=False,
 ):
-    """Sentiment-aware deflection filter & inflection snapper operating directly on Viterbi path."""
+    """Sentiment-aware deflection filter & reception/inflection snapper operating on Viterbi path."""
     codes = block_codes.copy()
 
     # Pass -1: Contested-Possession Retention (CHALLENGE.md Sec. 2.2):
@@ -341,6 +352,92 @@ def _filter_sentiment_deflections(
                     changed = True
                     break
 
+    if has_full_atd and block_dh1 is not None and block_da1 is not None:
+        # Pass 2C: Physical Reception & Clearance-Kick Forward Boundary Snapper
+        runs = _runs(codes)
+        for i in range(1, len(runs)):
+            t_trans = runs[i][0]
+            prev_team = runs[i - 1][2]
+            new_team = runs[i][2]
+            if (runs[i - 1][1] - runs[i - 1][0]) < 45 or (runs[i][1] - runs[i][0]) < 45:
+                continue
+            w_len = min(38, runs[i][1] - t_trans - 12)
+            if w_len < 12:
+                continue
+            sl = slice(t_trans, t_trans + w_len)
+            dn_s = (block_dh1 if new_team == 0 else block_da1)[sl]
+            vb_s = np.minimum(block_v_ball[sl], 28.0)
+            ab_s = block_a_ball[sl]
+            st_s = (
+                block_st[sl] * (1.0 if prev_team == 0 else -1.0)
+                if block_st is not None
+                else np.zeros(w_len, dtype=np.float64)
+            )
+            best_k = None
+            if vb_s[0] > 9.5 or dn_s[0] > 2.3:
+                k_vmax = int(np.argmax(vb_s[:min(22, w_len)]))
+                v_ref = max(float(vb_s[k_vmax]), 12.0)
+                for k in range(max(1, k_vmax), min(36, w_len)):
+                    if (vb_s[k] <= 0.72 * v_ref or ab_s[k] >= 22.0) and dn_s[k] <= 3.0:
+                        best_k = k
+                        break
+            elif float(np.mean(st_s[:15])) > 0.65 and float(np.mean(vb_s[:15])) < 6.5:
+                k_kick = next(
+                    (k for k in range(3, min(36, w_len)) if ab_s[k] >= 22.0 and vb_s[min(w_len - 1, k + 5)] >= 10.0),
+                    None,
+                )
+                if k_kick is not None:
+                    best_k = k_kick
+            if best_k is not None and 3 <= best_k <= 36:
+                codes[t_trans:t_trans + best_k] = prev_team
+
+        # Pass 3B: Full-ATD Ball-Control Deflection & Pre-Dead Exit Filter
+        changed = True
+        while changed:
+            changed = False
+            runs = _runs(codes)
+            if len(runs) >= 3:
+                for i in range(1, len(runs) - 1):
+                    s_r, e_r, k_r = runs[i]
+                    dur = e_r - s_r
+                    prev_dur = runs[i - 1][1] - runs[i - 1][0]
+                    next_dur = runs[i + 1][1] - runs[i + 1][0]
+                    if (
+                        runs[i - 1][2] == runs[i + 1][2]
+                        and prev_dur >= 45
+                        and (next_dur >= 45 or (i == len(runs) - 2 and next_dur >= 8))
+                        and dur < 68
+                    ):
+                        dk = (block_dh1 if k_r == 0 else block_da1)[s_r:e_r]
+                        p25d = float(np.percentile(dk, 25))
+                        st_opp = (
+                            float(np.mean(block_st[s_r:e_r])) * (1.0 if k_r == 0 else -1.0)
+                            if block_st is not None
+                            else 0.0
+                        )
+                        mean_vb = float(np.mean(block_v_ball[s_r:e_r])) if block_v_ball is not None else 0.0
+                        if p25d > 1.75 or (st_opp < -0.60 and mean_vb > 7.5):
+                            codes[s_r:e_r] = runs[i - 1][2]
+                            changed = True
+                            break
+
+        # Pass 3C: Pre-Stoppage Non-Control Clearance / Last-Touch Absorption
+        runs = _runs(codes)
+        if len(runs) >= 2:
+            s_last, e_last, k_last = runs[-1]
+            dur_last = e_last - s_last
+            prev_dur = runs[-2][1] - runs[-2][0]
+            if prev_dur >= 75 and dur_last < 58:
+                dk = (block_dh1 if k_last == 0 else block_da1)[s_last:e_last]
+                p25d = float(np.percentile(dk, 25))
+                st_opp = (
+                    float(np.mean(block_st[s_last:e_last])) * (1.0 if k_last == 0 else -1.0)
+                    if block_st is not None
+                    else 0.0
+                )
+                if p25d > 2.20 or st_opp <= -1.0:
+                    codes[s_last:e_last] = runs[-2][2]
+
     return codes
 
 
@@ -377,6 +474,12 @@ def decode_sentiment_hybrid_match(
     v_cam = features["v_cam"]
     vx_attack_h = features["vx_attack_h"]
     psi_chaos = sentiment["psi_chaos"]
+    has_full_atd = bool(features.get("has_full_atd", False))
+    dh1 = features.get("d_home_1")
+    da1 = features.get("d_away_1")
+    v_ball = features.get("v_ball")
+    a_ball = features.get("a_ball")
+    st_net = features.get("st_net_log_odds")
     code_to_str = np.array(["H", "A", "D"])
 
     for _, h_start, h_end_incl in half_blocks:
@@ -407,6 +510,12 @@ def decode_sentiment_hybrid_match(
                 psi_chaos[abs_s:abs_e],
                 logit_fused[abs_s:abs_e],
                 vx_attack_h[abs_s:abs_e],
+                block_dh1=dh1[abs_s:abs_e] if dh1 is not None else None,
+                block_da1=da1[abs_s:abs_e] if da1 is not None else None,
+                block_v_ball=v_ball[abs_s:abs_e] if v_ball is not None else None,
+                block_a_ball=a_ball[abs_s:abs_e] if a_ball is not None else None,
+                block_st=st_net[abs_s:abs_e] if st_net is not None else None,
+                has_full_atd=has_full_atd,
             )
             half_codes[lr_s:lr_e] = refined_live
 

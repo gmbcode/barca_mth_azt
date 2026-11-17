@@ -18,15 +18,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--out",
-        default=os.path.join(ROOT, "evaluation", "results", "sentiment_hybrid_v2.csv"),
+        default=os.path.join(ROOT, "evaluation", "results", "pressing_pinning_hybrid.csv"),
         help="Output submission CSV path",
     )
     parser.add_argument("--data-dir", default=None, help="Optional data directory override")
     args = parser.parse_args()
 
     print(
-        "Running 4-Stage Match-Sentiment-Adaptive Hybrid v2 Pipeline "
-        "(Physics Handover + OOF Stacked Specialist ML + Flick Directed Viterbi)..."
+        "Running 4-Stage Pressing-Pinning Full-ATD Hybrid Pipeline "
+        "(Matrix 9 Pin/Press + Control Physics + OOF Specialist ML + Reception Decoder)..."
     )
     result = run_sentiment_hybrid_pipeline(data_dir=args.data_dir, out_csv=args.out)
     labels = result["labels"]
@@ -39,10 +39,12 @@ def main():
         raise RuntimeError(f"Submission validation failed: {err}")
 
     counts = {lbl: int(np.sum(labels == lbl)) for lbl in ("H", "A", "D", "X")}
+    auc_nb = cv.get("oof_ha_auc_noball")
+    auc_str = f" (AUC={auc_nb:.4f})" if auc_nb is not None else ""
     print(
         f"Specialist Live CV -> GBDT_Full: {100*cv['oof_ha_acc_full']:.2f}% "
         f"(DuelStress={100*cv['oof_ha_acc_duel_stress']:.2f}%) | "
-        f"GBDT_NoBall(22-inv): {100*cv['oof_ha_acc_noball']:.2f}% | "
+        f"GBDT_NoBall(44-inv): {100*cv['oof_ha_acc_noball']:.2f}%{auc_str} | "
         f"OOF Meta LogLoss={rt['oof_meta_logloss']:.4f}"
     )
     print(

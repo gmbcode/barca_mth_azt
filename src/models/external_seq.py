@@ -34,10 +34,26 @@ def build_dilated_temporal_context(prob_seq, features, offsets=DILATED_OFFSETS):
         shifted_idx = np.clip(idx + delta, 0, n - 1)
         dilated_cols.append(log_p[shifted_idx])
 
-    # Concatenate key ball-independent kinematic regime signals (+ trajectory progression/reversal if present)
+    # Concatenate key ball-independent & Matrix 5/9 tactical regime signals
     extra_kin = []
-    if "dx_attack_3s" in features and "vx_rev_1s" in features:
-        extra_kin = [features["dx_attack_3s"], features["vx_rev_1s"]]
+    for k_name in (
+        "dx_attack_3s",
+        "vx_rev_1s",
+        "log_area_ratio",
+        "log_width_ratio",
+        "log_depth_ratio",
+        "pin_mean_a",
+        "pin_mean_h",
+        "press_cap_on_h",
+        "press_cap_on_a",
+        "bait_safety_h",
+        "bait_safety_a",
+        "net_press_hazard_h",
+    ):
+        if k_name in features:
+            extra_kin.append(features[k_name])
+    if "ctrl_h" in features and "ctrl_a" in features:
+        extra_kin.append(features["ctrl_h"] - features["ctrl_a"])
     kin_context = np.column_stack([
         features["cam_x_attack_h"],
         features["vx_attack_h"] / 10.0,

@@ -12,7 +12,7 @@ Implements Section 5 (Option 2 / Tier 2) of Proposed_Plan.md in full detail:
 
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score, log_loss
+from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 
 try:
     from xgboost import XGBClassifier
@@ -153,8 +153,8 @@ def fit_baum_welch_em(
             db = X_ball - mu_ball[k][None, :]
             ll_ball = -0.5 * np.mean((db * db) / var_ball[k][None, :] + np.log(var_ball[k][None, :]), axis=1)
 
-            # Factored emission: ball head gated by I[ball_seen_t]
-            log_ll[:, k] = np.log(pi_k[k] + 1e-6) + 1.5 * ll_kin + np.where(ball_seen, 2.5 * ll_ball, 0.0)
+            # Factored emission: ball head gated by I[ball_seen_t] with correlation-damped scaling
+            log_ll[:, k] = np.log(pi_k[k] + 1e-6) + 0.85 * ll_kin + np.where(ball_seen, 1.35 * ll_ball, 0.0)
 
         # Combine with Tier 1 physical regime anchor prior for stable EM convergence
         joint_ll = 0.65 * tier1_log_probs + 0.35 * log_ll
@@ -163,7 +163,7 @@ def fit_baum_welch_em(
             mx0 = np.max(joint_ll, axis=1, keepdims=True)
             log_post[:] = joint_ll - (mx0 + np.log(np.sum(np.exp(joint_ll - mx0), axis=1, keepdims=True)))
             for _, s_h, e_h in half_blocks:
-                log_post[s_h:e_h + 1] = _hmm_forward_backward_log(joint_ll[s_h:e_h + 1], stay_prob=0.975)
+                log_post[s_h:e_h + 1] = _hmm_forward_backward_log(joint_ll[s_h:e_h + 1], stay_prob=0.965)
         else:
             mx = np.max(joint_ll, axis=1, keepdims=True)
             log_post = joint_ll - (mx + np.log(np.sum(np.exp(joint_ll - mx), axis=1, keepdims=True)))
@@ -288,15 +288,21 @@ def fit_sentiment_specialist_gbdt_models(
     training so GBDT_Alive_Full breaks 100% raw memorization and generalizes into noisy duels.
     """
     X_full = features["X_full"]
-    # Omit centered sh_8/sh_20 (which Tier 1 already encodes directly) so GBDT_Alive_Full learns
-    # non-redundant multi-scale causal/directional momentum [11..13, 17..19, 23] + kinematics X_noball_inv!
+    # Omit raw single-frame & centered sh_8/sh_20 shortcuts so GBDT_Alive_Full learns genuine
+    # multi-scale momentum, ball-control proximity X_ctrl_atd, and Matrix 5/9 kinematics X_noball_inv.
     keep_ball_cols = [3, 4, 5, 6, 7, 11, 12, 13, 17, 18, 19, 23]
     n_ball_cols = len(keep_ball_cols)
     if "X_noball_inv" in features:
         X_noball = features["X_noball_inv"].copy()
     else:
         X_noball = X_full[:, [46, 47, 50, 51, 54, 56, 58, 72, 76, 77]].copy()
-    X_alive_full = np.hstack([X_full[:, keep_ball_cols], X_noball]).astype(np.float32)
+    if features.get("has_full_atd", False) and "X_ctrl_atd" in features:
+        X_ctrl = features["X_ctrl_atd"]
+        X_alive_full = np.hstack([X_full[:, keep_ball_cols], X_ctrl, X_noball]).astype(np.float32)
+        n_ctrl_cols = X_ctrl.shape[1]
+    else:
+        X_alive_full = np.hstack([X_full[:, keep_ball_cols], X_noball]).astype(np.float32)
+        n_ctrl_cols = 0
     n = len(X_full)
 
     graded_indices = np.flatnonzero(graded_mask)
@@ -339,49 +345,53 @@ def fit_sentiment_specialist_gbdt_models(
 
     rng = np.random.RandomState(seed)
 
-    def _corrupt_ball_duel_batch(X_in, r_gen, drop_p=0.30, flip_p=0.15):
+    def _corrupt_ball_duel_batch(X_in, r_gen, drop_p=0.35, flip_p=0.22):
         """Inject ball dropout + mild w=8 flicker noise without artificial entropy shortcuts."""
         Xo = X_in.copy()
         draw = r_gen.rand(len(Xo))
         drop_m = draw < drop_p
         flip_m = (draw >= drop_p) & (draw < (drop_p + flip_p))
-        # Dropped rows: neutral shares across indices [5:past_8, 6:fut_8, 8:past_20, 9:fut_20, 11:past_40]
-        Xo[drop_m, :n_ball_cols] = 0.0
+        Xo[drop_m, :n_ball_cols + n_ctrl_cols] = 0.0
         for col_share in (5, 6, 8, 9, 11):
             Xo[drop_m, col_share] = 0.5
-        # Short flicker rows: flip only ultra-short w=8 [5,6,7], leaving w=20, w=40 & X_noball_inv intact
-        # Do NOT alter col 4 (entropy) so trees never learn a synthetic parity-inversion shortcut!
         Xo[flip_m, 5] = 1.0 - Xo[flip_m, 5]
         Xo[flip_m, 6] = 1.0 - Xo[flip_m, 6]
         Xo[flip_m, 7] = -Xo[flip_m, 7]
+        Xo[flip_m, 8] = 1.0 - Xo[flip_m, 8]
+        Xo[flip_m, 9] = 1.0 - Xo[flip_m, 9]
+        Xo[flip_m, 10] = -Xo[flip_m, 10]
         rem_m = ~drop_m
         Xo[rem_m, 5:n_ball_cols] += r_gen.normal(
-            0.0, 0.16, size=(int(np.sum(rem_m)), n_ball_cols - 5)
+            0.0, 0.18, size=(int(np.sum(rem_m)), n_ball_cols - 5)
         ).astype(np.float32)
+        if n_ctrl_cols > 0:
+            Xo[rem_m, n_ball_cols:n_ball_cols + n_ctrl_cols] += r_gen.normal(
+                0.0, 0.08, size=(int(np.sum(rem_m)), n_ctrl_cols)
+            ).astype(np.float32)
         return Xo
 
     def _build_bin_clf(f_seed, is_nb):
         if HAS_XGB:
             return XGBClassifier(
-                n_estimators=150 if not is_nb else 120,
-                max_depth=4 if not is_nb else 3,
-                learning_rate=0.05 if not is_nb else 0.04,
+                n_estimators=140 if not is_nb else 150,
+                max_depth=4,
+                learning_rate=0.05,
                 subsample=0.80,
-                colsample_bytree=0.70,
-                min_child_weight=30 if not is_nb else 80,
-                reg_lambda=5.0 if not is_nb else 10.0,
-                reg_alpha=1.0 if not is_nb else 2.0,
+                colsample_bytree=0.68 if not is_nb else 0.75,
+                min_child_weight=50 if not is_nb else 35,
+                reg_lambda=8.0 if not is_nb else 6.0,
+                reg_alpha=1.5 if not is_nb else 1.0,
                 objective="binary:logistic",
                 random_state=f_seed,
                 n_jobs=4,
                 verbosity=0,
             )
         return HistGradientBoostingClassifier(
-            max_iter=150 if not is_nb else 120,
-            max_depth=4 if not is_nb else 3,
+            max_iter=140 if not is_nb else 150,
+            max_depth=4,
             learning_rate=0.05,
-            min_samples_leaf=40 if not is_nb else 80,
-            l2_regularization=5.0 if not is_nb else 10.0,
+            min_samples_leaf=50 if not is_nb else 35,
+            l2_regularization=8.0 if not is_nb else 6.0,
             random_state=f_seed,
         )
 
@@ -423,6 +433,7 @@ def fit_sentiment_specialist_gbdt_models(
         "oof_ha_acc_duel_stress": float(accuracy_score(y_anc, np.argmax(oof_anc_noisy, axis=1))),
         "oof_ha_logloss_duel_stress": float(log_loss(y_anc, oof_anc_noisy)),
         "oof_ha_acc_noball": float(accuracy_score(y_anc, np.argmax(oof_anc_noball, axis=1))),
+        "oof_ha_auc_noball": float(roc_auc_score(1 - y_anc, oof_anc_noball[:, 0])),
         "oof_ha_logloss_noball": float(log_loss(y_anc, oof_anc_noball)),
         "live_anchor_idx": live_anchor_idx,
         "y_anc": y_anc,

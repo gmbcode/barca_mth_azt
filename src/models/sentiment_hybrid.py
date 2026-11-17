@@ -181,8 +181,8 @@ def _fit_oof_meta_router_params(
         l_comb = (1.0 - w_ml) * lp_s[idx_mask] + w_ml * l_ml + b_flick * flick_feat[idx_mask]
         return l_comb
 
-    init_p = np.array([0.36, 0.22, 0.22], dtype=np.float64)
-    bounds = [(0.18, 0.50), (0.10, 0.36), (0.00, 0.45)]
+    init_p = np.array([0.32, 0.30, 0.16], dtype=np.float64)
+    bounds = [(0.16, 0.48), (0.12, 0.45), (0.00, 0.40)]
 
     for fold in unique_folds:
         tr_m = b_anc != fold
@@ -259,13 +259,13 @@ def fuse_models_by_match_sentiment(
     logit_seq = np.log(p_seq_h / (1.0 - p_seq_h))
 
     p_gf_h = np.clip(oof_ha_full[:, 0], 1e-3, 1.0 - 1e-3)
-    logit_gbdt_full = np.clip(np.log(p_gf_h / (1.0 - p_gf_h)) / 2.2, -3.2, 3.2)
+    logit_gbdt_full = np.clip(np.log(p_gf_h / (1.0 - p_gf_h)) / 2.2, -2.8, 2.8)
 
     p_gnb_h = np.clip(oof_ha_noball[:, 0], 1e-3, 1.0 - 1e-3)
-    logit_gbdt_noball = np.clip(np.log(p_gnb_h / (1.0 - p_gnb_h)) / 1.5, -2.5, 2.5)
+    logit_gbdt_noball = np.clip(np.log(p_gnb_h / (1.0 - p_gnb_h)) / 1.4, -2.8, 2.8)
 
-    logit_seq_cal = np.clip(logit_seq / 2.0, -3.0, 3.0)
-    logit_em_cal = np.clip(logit_em / 1.5, -2.8, 2.8)
+    logit_seq_cal = np.clip(logit_seq / 2.2, -2.8, 2.8)
+    logit_em_cal = np.clip(logit_em / 3.0, -2.2, 2.2)
 
     # 2. Fit OOF Sentiment Meta-Parameters cleanly across 6 temporal folds
     meta = _fit_oof_meta_router_params(
@@ -278,29 +278,33 @@ def fuse_models_by_match_sentiment(
         spec_cv_metrics=spec_cv_metrics,
     )
     w_nb_ml = meta["w_noball_in_ml"]
-    w_gf_ml = max(0.05, 0.72 - w_nb_ml - 0.16)
+    w_gf_ml = max(0.05, 0.74 - w_nb_ml - 0.12)
 
     logit_ml_visible = (
         w_gf_ml * logit_gbdt_full
         + w_nb_ml * logit_gbdt_noball
-        + 0.14 * logit_seq_cal
-        + (1.0 - w_gf_ml - w_nb_ml - 0.14) * logit_em_cal
+        + 0.16 * logit_seq_cal
+        + max(0.04, 1.0 - w_gf_ml - w_nb_ml - 0.16) * logit_em_cal
     )
-    logit_ml_occluded = 0.56 * logit_gbdt_noball + 0.22 * logit_seq_cal + 0.22 * logit_em_cal
+    logit_ml_occluded = 0.62 * logit_gbdt_noball + 0.24 * logit_seq_cal + 0.14 * logit_em_cal
     logit_ml = np.where(psi_occl > 0.5, logit_ml_occluded, logit_ml_visible)
 
     # 3. Sentiment Routing Weight w_ml(t) vs w_phys(t):
     # - Calm Control: Physics persistence dominates
     # - Contested Chaos / Vertical Transition: OOF-learned w_chaos_boost elevates ML share
-    # - Occluded Flight (Same-Team): 0.68 Physics Bridge + 0.32 ML NoBall
-    # - Occluded Flight (Contested Handover pre != post): 0.50 Physics Handover + 0.50 ML NoBall
+    # - In-Flight Pass: Shift weight toward ML + Matrix 9 structural prior
+    # - Occluded Flight (Same-Team / Contested): Matrix 9 NoBall ML bridge
     active_chaos_or_tempo = np.maximum(psi_chaos, 0.75 * psi_tempo)
     w_ml_visible = np.clip(
-        0.24 + meta["w_chaos_boost"] * active_chaos_or_tempo - 0.06 * psi_tripod,
-        0.16,
+        0.26 + meta["w_chaos_boost"] * active_chaos_or_tempo - 0.06 * psi_tripod,
+        0.18,
         0.64,
     )
-    w_ml_occl = np.where(contested_occl, meta["w_occl_contested_ml"], 0.32)
+    has_full_atd = bool(features.get("has_full_atd", False))
+    in_flight = features.get("in_flight", np.zeros(n, dtype=bool))
+    if has_full_atd:
+        w_ml_visible = np.where(in_flight, np.maximum(w_ml_visible, 0.48), w_ml_visible)
+    w_ml_occl = np.where(contested_occl, meta["w_occl_contested_ml"], 0.38 if has_full_atd else 0.32)
     w_ml = np.where(psi_occl > 0.5, w_ml_occl, w_ml_visible)
     w_phys = 1.0 - w_ml
 
@@ -332,30 +336,46 @@ def fuse_models_by_match_sentiment(
     probs /= np.sum(probs, axis=1, keepdims=True)
     hybrid_log_probs = np.log(probs)
 
-    # 6. Directed Asymmetric Turnover Gates modulated by Sentiment + Flick Tactics + Retention
+    # 6. Directed Asymmetric Turnover Gates modulated by Sentiment + Matrix 9 Pinning/Press + In-Flight Hold
     base_gate = np.clip(
-        0.85 + 0.45 * psi_chaos + 0.30 * psi_tempo - 0.30 * psi_tripod,
-        0.65,
-        1.52,
+        0.85 + 0.42 * psi_chaos + 0.28 * psi_tempo - 0.28 * psi_tripod,
+        0.62,
+        1.48,
     )
+    if has_full_atd:
+        base_gate = np.where(in_flight, base_gate * 0.55, base_gate)
     # In contested missing-ball handovers, slightly ease transitions so NoBall can locate handover
     base_gate = np.where(contested_occl, np.maximum(base_gate, 1.18), base_gate)
 
-    # Flick counter-press & high-retention stability protect Home against brief noisy drops unless
-    # Away cleanly breaks behind the high line (psi_counter_break_a)
+    if has_full_atd:
+        pr_h = features["press_cap_on_h"]
+        pr_a = features["press_cap_on_a"]
+        bait_h = features["bait_safety_h"]
+        bait_a = features["bait_safety_a"]
+        pin_a = features["pin_mean_a"]
+        pin_h = features["pin_mean_h"]
+        m9_ha = np.clip(1.0 + 0.40 * (pr_h - 0.40) - 0.45 * (bait_h - 0.28) - 0.18 * pin_a, 0.65, 1.55)
+        m9_ah = np.clip(1.0 + 0.40 * (pr_a - 0.35) - 0.45 * (bait_a - 0.25) - 0.18 * pin_h, 0.65, 1.55)
+    else:
+        m9_ha = 1.0
+        m9_ah = 1.0
+
+    # Flick counter-press & high-retention stability + Matrix 9 pinning safety guard against noise turnovers
     break_guard = 1.0 - psi_counter_break_a
     turnover_gate_ha = np.clip(
         base_gate
-        * (1.0 - 0.14 * ret_h * break_guard - 0.08 * psi_high_press)
-        * (1.0 + 0.25 * psi_counter_break_a),
-        0.55,
-        1.75,
+        * m9_ha
+        * (1.0 - 0.10 * ret_h * break_guard - 0.06 * psi_high_press)
+        * (1.0 + 0.20 * psi_counter_break_a),
+        0.45,
+        1.70,
     )
     turnover_gate_ah = np.clip(
         base_gate
-        * (1.0 + 0.12 * psi_high_press - 0.10 * psi_counter_break_a),
-        0.55,
-        1.75,
+        * m9_ah
+        * (1.0 + 0.10 * psi_high_press - 0.08 * psi_counter_break_a),
+        0.45,
+        1.70,
     )
 
     dom = sentiment["dominant_sentiment"]

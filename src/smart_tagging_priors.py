@@ -70,7 +70,33 @@ def compute_smart_tagging_priors(stage1_data, game=GAME, data_dir=None):
         }
 
     v_cam = stage1_data["cam_kalman"]["speed_smooth"]
-    raw_codes = stage1_data["atd"]["raw_codes"]
+    atd = stage1_data["atd"]
+    pitch = stage1_data["pitch"]
+    has_full_atd = bool(atd.get("has_full_atd", False))
+    raw_codes = atd["raw_codes"]
+    bx = atd["ball_x_m"]
+    by = atd["ball_y_m"]
+    v_ball = atd["ball_kalman"]["speed_smooth"]
+    pr_tot = (
+        atd.get("press_cap_on_h", np.zeros(n_frames, dtype=np.float64))
+        + atd.get("press_cap_on_a", np.zeros(n_frames, dtype=np.float64))
+    )
+    ms_all = atd["mean_speed_all"]
+    inbounds = (
+        (raw_codes < 2)
+        & np.isfinite(bx)
+        & np.isfinite(by)
+        & (bx >= -0.3)
+        & (bx <= pitch[0] + 0.3)
+        & (by >= -0.3)
+        & (by <= pitch[1] + 0.3)
+    )
+    strict_oob = (
+        (raw_codes < 2)
+        & np.isfinite(bx)
+        & np.isfinite(by)
+        & ((bx < -0.5) | (bx > pitch[0] + 0.5) | (by < -0.5) | (by > pitch[1] + 0.5))
+    )
 
     events = []
     for instance in ET.parse(st_path).iter("instance"):
@@ -111,33 +137,64 @@ def compute_smart_tagging_priors(stage1_data, game=GAME, data_dir=None):
                 mid = (s_f + e_f) // 2
                 kickoff_frames.append(mid)
             else:
-                # 35s window [s_f, e_f]: find exact restart strike frame t_kick where camera/ball accelerates
-                search_end = min(e_f, s_f + 450)
-                if search_end > s_f + 25:
-                    # Look for transition from low camera/ball speed to active play
-                    low_v = v_cam[s_f:search_end] < 0.35
-                    if np.any(low_v):
-                        last_low = int(np.flatnonzero(low_v)[-1])
-                        t_kick = min(search_end, s_f + last_low + 5)
-                    else:
-                        t_kick = s_f + int(np.argmin(v_cam[s_f:search_end])) + 5
-                    set_piece_pre_kick_d[s_f:t_kick] = True
-                    if team_code in (0, 1):
-                        post_end = min(n_frames, t_kick + 75)
-                        set_piece_restart_team[t_kick:post_end] = team_code
-                    else:
-                        # For Throw-in (Team == N/A), infer from majority raw contact in [t_kick, t_kick+50]
-                        post_slice = raw_codes[t_kick:min(n_frames, t_kick + 50)]
-                        h_c = np.sum(post_slice == 0)
-                        a_c = np.sum(post_slice == 1)
-                        if h_c + a_c > 0:
-                            set_piece_restart_team[t_kick:min(n_frames, t_kick + 50)] = (
-                                0 if h_c >= a_c else 1
-                            )
+                # Forward-scan for true ball launch / restart kick inside 35s window [s_f, e_f]
+                d_start = s_f
+                limit = min(e_f, s_f + 650)
+                t_kick = limit
+                if has_full_atd:
+                    while d_start > 0 and (s_f - d_start) < 350:
+                        prev = d_start - 1
+                        if (
+                            strict_oob[prev]
+                            or raw_codes[prev] == 2
+                            or (pr_tot[prev] < 0.24 and v_ball[prev] < 2.6 and ms_all[prev] < 1.45)
+                        ):
+                            d_start -= 1
+                        else:
+                            break
+                    for t in range(s_f, max(s_f, limit - 12)):
+                        if np.mean(inbounds[t:t + 12]) >= 0.75 and (
+                            np.mean(v_ball[t:t + 12] >= 3.6) >= 0.50
+                            or (np.max(v_ball[t:t + 15]) >= 5.5 and np.mean(v_ball[t:t + 12]) >= 3.0)
+                        ):
+                            t_kick = t
+                            break
+                else:
+                    search_end = min(e_f, s_f + 450)
+                    t_kick = s_f
+                    for t in range(s_f, max(s_f, search_end - 12)):
+                        if np.mean(v_cam[t:t + 12] >= 0.45) >= 0.65:
+                            t_kick = t
+                            break
+                if t_kick > d_start:
+                    set_piece_pre_kick_d[d_start:t_kick] = True
+                if team_code in (0, 1):
+                    post_end = min(n_frames, t_kick + 75)
+                    set_piece_restart_team[t_kick:post_end] = team_code
+                else:
+                    # For Throw-in (Team == N/A), infer from majority raw contact in [t_kick, t_kick+50]
+                    post_slice = raw_codes[t_kick:min(n_frames, t_kick + 50)]
+                    h_c = np.sum(post_slice == 0)
+                    a_c = np.sum(post_slice == 1)
+                    if h_c + a_c > 0:
+                        set_piece_restart_team[t_kick:min(n_frames, t_kick + 50)] = (
+                            0 if h_c >= a_c else 1
+                        )
 
         elif code == "GOALS":
-            # Mark celebration & walk-back inside GOALS window as D
-            goal_dead_mask[s_f:e_f] = True
+            # Mark ONLY the sustained post-shot dead celebration tail (never live build-up play!)
+            if has_full_atd:
+                live_act = inbounds & ((v_ball > 2.5) | (pr_tot > 0.35))
+                last_live = np.flatnonzero(live_act[s_f:min(e_f, s_f + 900)])
+                start_scan = s_f + (int(last_live[-1]) + 10 if len(last_live) else 0)
+                if e_f - start_scan >= 300:
+                    goal_dead_mask[start_scan:e_f] = True
+            else:
+                dead_tail = (raw_codes[s_f:e_f] == 2) & (v_cam[s_f:e_f] < 0.8)
+                live_pt = np.flatnonzero(~dead_tail[:min(len(dead_tail), 900)])
+                start_scan = s_f + (int(live_pt[-1]) + 10 if len(live_pt) else 0)
+                if e_f - start_scan >= 300:
+                    goal_dead_mask[start_scan:e_f] = True
 
     st_net_log_odds = np.clip(st_votes_h - st_votes_a, -3.0, 3.0) * 0.65
 

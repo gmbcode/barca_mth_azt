@@ -18,6 +18,7 @@ from src.physics_matrices import (  # noqa: E402
     compute_multiscale_contention_matrix,
     compute_optical_flow_and_jacobian_matrices,
     compute_player_interaction_matrices,
+    compute_press_and_pinning_matrices,
     compute_team_spatial_inertia_tensors,
     kalman_rts_smoother_2d,
 )
@@ -59,6 +60,8 @@ def stream_parse_atd_raw(raw_path, team_of_track, n_frames, pitch=(105.3, 68.0))
     d_away_1 = np.full(n_frames, np.inf, dtype=np.float64)
     d_away_2 = np.full(n_frames, np.inf, dtype=np.float64)
     nearest_slot = np.full(n_frames, -1, dtype=np.int16)
+    px_all = np.full((n_frames, n_slots), np.nan, dtype=np.float32)
+    py_all = np.full((n_frames, n_slots), np.nan, dtype=np.float32)
 
     mean_speed_all = np.full(n_frames, np.nan, dtype=np.float64)
     p90_speed_all = np.full(n_frames, np.nan, dtype=np.float64)
@@ -109,6 +112,8 @@ def stream_parse_atd_raw(raw_path, team_of_track, n_frames, pitch=(105.3, 68.0))
                 if s_val and s_val[0] != "N":
                     ps[s_idx] = float(s_val)
 
+            px_all[f_idx] = px
+            py_all[f_idx] = py
             valid_s = np.isfinite(ps)
             if np.any(valid_s):
                 mean_speed_all[f_idx] = float(np.mean(ps[valid_s]))
@@ -186,6 +191,8 @@ def stream_parse_atd_raw(raw_path, team_of_track, n_frames, pitch=(105.3, 68.0))
         "area_h": area_h,
         "area_a": area_a,
         "log_area_ratio": np.log(np.maximum(area_h, 1.0) / np.maximum(area_a, 1.0)),
+        "px_all": px_all,
+        "py_all": py_all,
     }
 
 
@@ -247,6 +254,34 @@ def load_stage1_data(game=GAME, data_dir=None):
             max_jump_ms=38.0,
         )
         atd_data["ball_kalman"] = ball_kalman
+
+        # Matrix 5 (2x2 Shape Tensors) & Matrix 9 (Pressing Commitment + Attacker-Behind Pinning)
+        px64 = atd_data.pop("px_all").astype(np.float64)
+        py64 = atd_data.pop("py_all").astype(np.float64)
+        vx64 = np.zeros_like(px64)
+        vy64 = np.zeros_like(py64)
+        dt2 = 2.0 / fps
+        v_pair = np.isfinite(px64[:-2]) & np.isfinite(px64[2:]) & np.isfinite(py64[:-2]) & np.isfinite(py64[2:])
+        vx64[1:-1] = np.where(v_pair, np.clip((px64[2:] - px64[:-2]) / dt2, -12.0, 12.0), 0.0)
+        vy64[1:-1] = np.where(v_pair, np.clip((py64[2:] - py64[:-2]) / dt2, -12.0, 12.0), 0.0)
+        inertia = compute_team_spatial_inertia_tensors(px64, py64, team_of_track, gk_slots=gk_slots)
+        press_pin = compute_press_and_pinning_matrices(
+            px64,
+            py64,
+            vx64,
+            vy64,
+            team_of_track,
+            ball_kalman["x_smooth"],
+            ball_kalman["y_smooth"],
+            pitch_length=pitch[0],
+            gk_slots=gk_slots,
+        )
+        atd_data.update({
+            "log_area_ratio": inertia["log_area_ratio"],
+            "log_width_ratio": np.log(np.maximum(inertia["eig2_h"], 0.5) / np.maximum(inertia["eig2_a"], 0.5)),
+            "log_depth_ratio": np.log(np.maximum(inertia["eig1_h"], 0.5) / np.maximum(inertia["eig1_a"], 0.5)),
+            **press_pin,
+        })
     else:
         raw_csv_path = os.path.join(ROOT, "evaluation", "results", "baseline_raw.csv")
         raw_df = pd.read_csv(raw_csv_path)
@@ -260,7 +295,30 @@ def load_stage1_data(game=GAME, data_dir=None):
             "ball_kalman": cam_kalman,
             "mean_speed_all": np.clip(0.8 * cam_kalman["speed_smooth"] + 1.5, 0.8, 6.0),
             "p90_speed_all": np.clip(1.4 * cam_kalman["speed_smooth"] + 2.5, 1.2, 9.0),
+            "mean_speed_h": np.clip(0.8 * cam_kalman["speed_smooth"] + 1.5, 0.8, 6.0),
+            "mean_speed_a": np.clip(0.8 * cam_kalman["speed_smooth"] + 1.5, 0.8, 6.0),
+            "d_home_1": np.full(n_frames, np.inf, dtype=np.float64),
+            "d_home_2": np.full(n_frames, np.inf, dtype=np.float64),
+            "d_away_1": np.full(n_frames, np.inf, dtype=np.float64),
+            "d_away_2": np.full(n_frames, np.inf, dtype=np.float64),
+            "centroid_hx": cam_kalman["x_smooth"],
+            "centroid_hy": cam_kalman["y_smooth"],
+            "centroid_ax": cam_kalman["x_smooth"],
+            "centroid_ay": cam_kalman["y_smooth"],
+            "area_h": np.full(n_frames, 150.0, dtype=np.float64),
+            "area_a": np.full(n_frames, 150.0, dtype=np.float64),
             "log_area_ratio": np.zeros(n_frames, dtype=np.float64),
+            "log_width_ratio": np.zeros(n_frames, dtype=np.float64),
+            "log_depth_ratio": np.zeros(n_frames, dtype=np.float64),
+            "pin_mean_a": np.zeros(n_frames, dtype=np.float64),
+            "pin_mean_h": np.zeros(n_frames, dtype=np.float64),
+            "press_cap_on_h": np.zeros(n_frames, dtype=np.float64),
+            "press_cap_on_a": np.zeros(n_frames, dtype=np.float64),
+            "bait_safety_h": np.full(n_frames, 0.5, dtype=np.float64),
+            "bait_safety_a": np.full(n_frames, 0.5, dtype=np.float64),
+            "n_free_outlets_h": np.zeros(n_frames, dtype=np.float64),
+            "n_free_outlets_a": np.zeros(n_frames, dtype=np.float64),
+            "net_press_hazard_h": np.zeros(n_frames, dtype=np.float64),
             "nearest_slot": np.full(n_frames, -1, dtype=np.int16),
             "track_retention_prior": np.full(n_frames, 0.5, dtype=np.float64),
         }

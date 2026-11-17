@@ -139,11 +139,15 @@ def extract_physics_feature_dict(stage1_data, st_priors):
     flip_rate_1s, _ = _rolling_mean_std_min_max(flips, 12)
     flip_rate_4s, _ = _rolling_mean_std_min_max(flips, 50)
 
-    # Match clock / half progress in [0, 1]
+    # Match clock / half progress in [0, 1] (works for full BAR-ATH and small unit-test clips)
     half_progress = np.zeros(n, dtype=np.float64)
-    half_progress[11185:90652] = np.linspace(0.0, 1.0, 90652 - 11185)
-    half_progress[110808:190198] = np.linspace(0.0, 1.0, 190198 - 110808)
-    is_second_half = (np.arange(n) >= 100000).astype(np.float64)
+    if n >= 190198:
+        half_progress[11185:90652] = np.linspace(0.0, 1.0, 90652 - 11185)
+        half_progress[110808:190198] = np.linspace(0.0, 1.0, 190198 - 110808)
+        is_second_half = (np.arange(n) >= 100000).astype(np.float64)
+    else:
+        half_progress[:] = np.linspace(0.0, 1.0, n)
+        is_second_half = np.zeros(n, dtype=np.float64)
 
     # -----------------------------------------------------------------------
     # Assemble 42 Ball-Dependent Features + 46 Ball-Independent Features = 88
@@ -259,6 +263,64 @@ def extract_physics_feature_dict(stage1_data, st_priors):
     vx_rev_1s = (_fmean(vx_cs, 15) - _pmean(vx_cs, 15)) / 10.0
     vx_rev_3s = (_fmean(vx_cs, 40) - _pmean(vx_cs, 40)) / 10.0
 
+    # Control proximity, ball kinematics, inbounds/OOB flags & Matrix 5/9 tactical features
+    has_full_atd = bool(atd.get("has_full_atd", False))
+    dh1_raw = atd.get("d_home_1", np.full(n, np.inf, dtype=np.float64))
+    da1_raw = atd.get("d_away_1", np.full(n, np.inf, dtype=np.float64))
+    dh2_raw = atd.get("d_home_2", np.full(n, np.inf, dtype=np.float64))
+    da2_raw = atd.get("d_away_2", np.full(n, np.inf, dtype=np.float64))
+    dh1 = np.where(np.isfinite(dh1_raw), dh1_raw, 35.0)
+    da1 = np.where(np.isfinite(da1_raw), da1_raw, 35.0)
+    dh2 = np.where(np.isfinite(dh2_raw), dh2_raw, 45.0)
+    da2 = np.where(np.isfinite(da2_raw), da2_raw, 45.0)
+
+    bk = atd["ball_kalman"]
+    v_ball = np.clip(bk["speed_smooth"], 0.0, 45.0)
+    a_ball = np.clip(bk["acc_mag_smooth"], 0.0, 65.0)
+    bx = atd["ball_x_m"]
+    by = atd["ball_y_m"]
+    inbounds = (
+        (raw_codes < 2)
+        & np.isfinite(bx)
+        & np.isfinite(by)
+        & (bx >= -0.3)
+        & (bx <= 105.6)
+        & (by >= -0.3)
+        & (by <= 68.3)
+    )
+    strict_oob = (
+        (raw_codes < 2)
+        & np.isfinite(bx)
+        & np.isfinite(by)
+        & ((bx < -0.5) | (bx > 105.8) | (by < -0.5) | (by > 68.5))
+    )
+
+    ctrl_h = np.where(has_full_atd & (raw_codes < 2), np.exp(-0.5 * (dh1 / 2.2) ** 2), (raw_codes == 0).astype(np.float64))
+    ctrl_a = np.where(has_full_atd & (raw_codes < 2), np.exp(-0.5 * (da1 / 2.2) ** 2), (raw_codes == 1).astype(np.float64))
+    min_d = np.minimum(dh1, da1)
+    in_flight = has_full_atd & (raw_codes < 2) & ((min_d > 2.7) | ((v_ball > 9.5) & (min_d > 1.7)))
+
+    log_width_ratio = atd.get("log_width_ratio", np.zeros(n, dtype=np.float64))
+    log_depth_ratio = atd.get("log_depth_ratio", np.zeros(n, dtype=np.float64))
+    pin_mean_a = atd.get("pin_mean_a", np.zeros(n, dtype=np.float64))
+    pin_mean_h = atd.get("pin_mean_h", np.zeros(n, dtype=np.float64))
+    press_cap_on_h = atd.get("press_cap_on_h", np.zeros(n, dtype=np.float64))
+    press_cap_on_a = atd.get("press_cap_on_a", np.zeros(n, dtype=np.float64))
+    bait_safety_h = atd.get("bait_safety_h", np.full(n, 0.5, dtype=np.float64))
+    bait_safety_a = atd.get("bait_safety_a", np.full(n, 0.5, dtype=np.float64))
+    n_free_outlets_h = atd.get("n_free_outlets_h", np.zeros(n, dtype=np.float64))
+    n_free_outlets_a = atd.get("n_free_outlets_a", np.zeros(n, dtype=np.float64))
+    net_press_hazard_h = atd.get("net_press_hazard_h", np.zeros(n, dtype=np.float64))
+
+    chx = atd.get("centroid_hx", pose["cam_x_m"])
+    cax = atd.get("centroid_ax", pose["cam_x_m"])
+    hx_att = np.where(half_sign > 0, chx / 105.3, 1.0 - chx / 105.3)
+    ax_att = np.where(half_sign > 0, cax / 105.3, 1.0 - cax / 105.3)
+    bx_att = np.where(half_sign > 0, bk["x_smooth"] / 105.3, 1.0 - bk["x_smooth"] / 105.3)
+    ms_h = np.nan_to_num(atd.get("mean_speed_h", atd["mean_speed_all"]), nan=2.0)
+    ms_a = np.nan_to_num(atd.get("mean_speed_a", atd["mean_speed_all"]), nan=2.0)
+    ret_prior = atd.get("track_retention_prior", np.full(n, 0.5, dtype=np.float64))
+
     X_noball_inv = np.column_stack([
         cam_x_attack_h,
         vx_attack_h / 10.0,
@@ -282,6 +344,44 @@ def extract_physics_feature_dict(stage1_data, st_priors):
         _fmean(vx_cs, 75) / 10.0,
         vx_rev_1s,
         vx_rev_3s,
+        atd["log_area_ratio"],
+        log_width_ratio,
+        log_depth_ratio,
+        pin_mean_a,
+        pin_mean_h,
+        pin_mean_a - pin_mean_h,
+        press_cap_on_h,
+        press_cap_on_a,
+        press_cap_on_h - press_cap_on_a,
+        bait_safety_h,
+        bait_safety_a,
+        bait_safety_h - bait_safety_a,
+        n_free_outlets_h / 10.0,
+        n_free_outlets_a / 10.0,
+        (n_free_outlets_h - n_free_outlets_a) / 10.0,
+        net_press_hazard_h,
+        hx_att,
+        ax_att,
+        hx_att - ax_att,
+        ms_h / 5.0,
+        ms_a / 5.0,
+        st_priors["st_net_log_odds"],
+    ]).astype(np.float32)
+
+    X_ctrl_atd = np.column_stack([
+        np.clip(dh1, 0.0, 35.0) / 15.0,
+        np.clip(da1, 0.0, 35.0) / 15.0,
+        np.clip(da1 - dh1, -15.0, 15.0) / 10.0,
+        np.clip(dh2, 0.0, 45.0) / 20.0,
+        np.clip(da2, 0.0, 45.0) / 20.0,
+        ctrl_h,
+        ctrl_a,
+        ctrl_h - ctrl_a,
+        np.clip(v_ball, 0.0, 35.0) / 10.0,
+        np.clip(a_ball, 0.0, 50.0) / 15.0,
+        in_flight.astype(np.float32),
+        bx_att,
+        ret_prior - 0.5,
     ]).astype(np.float32)
 
     features = {
@@ -326,14 +426,35 @@ def extract_physics_feature_dict(stage1_data, st_priors):
         "mean_speed_all": atd["mean_speed_all"],
         "p90_speed_all": atd["p90_speed_all"],
         "log_area_ratio": atd["log_area_ratio"],
+        "log_width_ratio": log_width_ratio,
+        "log_depth_ratio": log_depth_ratio,
+        "pin_mean_a": pin_mean_a,
+        "pin_mean_h": pin_mean_h,
+        "press_cap_on_h": press_cap_on_h,
+        "press_cap_on_a": press_cap_on_a,
+        "bait_safety_h": bait_safety_h,
+        "bait_safety_a": bait_safety_a,
+        "n_free_outlets_h": n_free_outlets_h,
+        "n_free_outlets_a": n_free_outlets_a,
+        "net_press_hazard_h": net_press_hazard_h,
+        "d_home_1": dh1,
+        "d_away_1": da1,
+        "ctrl_h": ctrl_h,
+        "ctrl_a": ctrl_a,
+        "v_ball": v_ball,
+        "a_ball": a_ball,
+        "in_flight": in_flight,
+        "inbounds": inbounds,
+        "strict_oob": strict_oob,
         "st_net_log_odds": st_priors["st_net_log_odds"],
         "set_piece_pre_kick_d": st_priors["set_piece_pre_kick_d"],
         "set_piece_restart_team": st_priors["set_piece_restart_team"],
         "goal_dead_mask": st_priors["goal_dead_mask"],
-        "has_full_atd": bool(atd.get("has_full_atd", False)),
-        "track_retention_prior": atd.get("track_retention_prior", np.full(n, 0.5, dtype=np.float64)),
+        "has_full_atd": has_full_atd,
+        "track_retention_prior": ret_prior,
         "X_full": X_full,
         "X_noball_inv": X_noball_inv,
+        "X_ctrl_atd": X_ctrl_atd,
         "ball_feature_indices": ball_feature_indices,
         "noball_feature_indices": noball_feature_indices,
     }

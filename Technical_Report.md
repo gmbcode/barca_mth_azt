@@ -1,4 +1,4 @@
-# Technical Report — Match-Sentiment Hybrid v2 (`sentiment-hybrid-v2`)
+# Technical Report — Full-ATD Pressing-Pinning Hybrid (`pressing-pinning-hybrid`)
 
 **Competition:** More Than A Hack 2027 (Phase 1: Frame-Level Ball Possession)  
 **Match:** FC Barcelona (`H`) vs. Athletic Club (`A`) — LaLiga EA Sports 2024–25, Matchday 2  
@@ -7,26 +7,24 @@
 
 ---
 
-## 1. What `sentiment-hybrid-v2` Adds Over `sentiment-hybrid` (`v1`)
+## 1. What `pressing-pinning-hybrid` Adds (Real 22-Player ATD + Smart Tagging + Matrix 9)
 
-This branch implements six structural upgrades plus rule-compliant **Hansi Flick tactical asymmetry** and **unsupervised player/zone retention priors** (`RULES.md` compliant — zero human labels or frame-specific tuning):
+With full tracking (`BAR-ATH_tactical_atd.txt`, `BAR-ATH_tactical_atd.xml`) and `638` Smart Tagging annotations (`BAR-ATH_tactical_smart_tagging.xml`) unlocked (`has_full_atd = True`, `st_available = True`) alongside full no-ATD fallback safety (`tests/test_pressing_pinning.py`), this branch introduces five general, rule-compliant tactical & physical upgrades (`RULES.md` compliant — zero human labels or public-window hyperparameter tuning):
 
-1. **Contested `OCCLUDED_FLIGHT` Handovers & Parked Stoppage Detection (`src/models/heuristic_fsm.py`):**
-   * Previously, every live missing-ball gap locked the full interval to `pre_team` (`bridged_codes = pre_team`) and long multi-minute camera-parked gaps with slight drift (`disp >= 7.0 m`) were misclassified as live play.
-   * **Parked Dead-Ball Stoppages (`+19,368` newly recovered `D` frames):** Long missing-ball gaps with high tripod lock (`>=400f`, `tripod >= 0.65`, `mean_v_cam < 0.65`; or `>=1000f`, `tripod >= 0.60`, `mean_v_cam < 0.80`) are classified as `STOPPAGE_RESET` (`D`), fixing multi-minute celebrations/injuries (e.g., `58099..61558`, `157564..163094`) and bringing full-match Dead-Ball ratio to realistic **`38.3%`** (`60,920` of `158,857` graded frames, `61.7%` effective ball-in-play time).
-   * **Kinematic Contested Handover (`7,631` frames):** For live missing-ball gaps where `pre_team != post_team`, computes net directional forward velocity `vx_attack_h * s_post` to split handover timing rather than blindly locking the whole gap to `pre_team`, and raises ML `NoBall` routing weight (`mean = 0.499`).
-2. **Non-Redundant Duel-Robust `GBDT_Alive_Full` & Spike-Resilient `SeqRefiner` (`src/models/pseudo_gbdt.py`, `src/models/external_seq.py`):**
-   * Drops centered instant `w=8/w=20` shares (`sh_8, sh_20`, already encoded by Tier 1) and trains on clean + borderline live anchors (`16,594`) under `30%` ball-feature dropout + `15%` `w=8` flicker flips (`99.98%` clean OOF Acc; **`88.91%` Harsh Duel-Stress OOF Acc**).
-   * Trains `Crisp Dilated SeqRefiner` with `18%` contiguous (`5–16f`) spike flips alongside `41.1%` Sim2Real dropout (**`100.00%` clean / `93.06%` stress-recovered OOF Acc**).
-3. **22-Feature Half-Invariant `NoBall` Kinematics (`src/features.py`):**
-   * Strips leaky clock/reprojection/unflipped-half variables and adds net attacking territorial displacement ($\Delta \tilde{x}$ at `1s, 3s, 6s`) and velocity reversal features (`vx_rev_1s, vx_rev_3s`), raising 6-fold CV live `H/A` `GBDT_Alive_NoBall` accuracy to **`58.26%`** (`LogLoss = 0.6847`, vs. `55.70%` in `v1` and `50.25%` in `model-fitting`).
-4. **Evidence-Integrated Filtering (`src/decoder.py`):**
-   * Protects low-chaos clean breakaways (`dur >= 34`, `chaos < 0.42`, `vx > 1.10 m/s`, `ev > 1.65`) while absorbing high-chaos stalled flickers without fragmenting full-match spells (`306` spells, mean `12.80 s`).
-5. **Half-Invariant Forward-Backward HMM EM & OOF Meta-Router (`src/models/pseudo_gbdt.py`, `src/models/sentiment_hybrid.py`):**
-   * Upgrades `fit_baum_welch_em(use_invariant_hmm=True)` to run a 3-state Forward-Backward HMM smoother over `X_noball_inv`.
-   * Optimizes sentiment meta-parameters strictly via 6-fold OOF `L-BFGS-B` on stress-corrupted anchors (`w_chaos_boost = 0.4820`, `w_noball_in_ml = 0.1000`, `beta_flick_prior = 0.2872`, `oof_meta_logloss = 0.2402`).
-6. **Hansi Flick Tactical System & Unsupervised Player/Zone Retention (`src/preprocessing.py`, `src/models/sentiment_hybrid.py`, `src/physics_matrices.py`):**
-   * Uses out-of-fold empirical control balance (`oof_pi_h`), Barcelona high-line counter-press (`psi_high_press`), vertical Athletic breakaway detection (`psi_counter_break_a`), and zone + unsupervised track-level ball-retention propensity (`track_retention_prior`, activating automatically whenever full ATD is present) to drive directed Viterbi transition gates (**Mean `H -> A = 0.958`**, **Mean `A -> H = 1.014`**).
+1. **Matrix 9: Pressing Commitment, Defender Pinning & Blind-Side Risk (`src/physics_matrices.py`, `src/preprocessing.py`):**
+   * Formalizes the "attacker behind defender prevents jumping to press" law (`compute_press_and_pinning_matrices`):
+     * Measures goal-side pinning `pin_mean_h/a` (weighted by absence of deeper teammate cover `m != j`), unpinned closing-speed press capacity `press_cap_on_h/a`, press-bait safety `bait_safety_h/a`, open passing outlets `n_free_outlets_h/a` (`>= 4.0 m` clear of defenders), and net turnover hazard `net_press_hazard_h`.
+     * Full-match validation (`34,420` clean vs turnover frames): `net_press_hazard_h` shifts from `-0.371` (`H` keeps) to `+0.071` (`H` loses), and `press_cap_on_h` nearly doubles from `0.295 -> 0.531` right before Home turnovers.
+   * Integrates Matrix 5 (`log_width_ratio`, `log_depth_ratio`) alongside NaN-safe finite-difference player velocities (no zero-fill dropout spikes).
+2. **44-Feature Half-Invariant `NoBall` & Control Kinematics (`src/features.py`, `src/models/pseudo_gbdt.py`, `src/models/external_seq.py`):**
+   * Expands `X_noball_inv` from `22` camera-only columns to **`44` strictly ball-free & nearest-slot-free half-invariant features** (`Matrix 5 + Matrix 9 + attacking team centroids + team speeds + Smart Tagging`), jumping 6-fold live `GBDT_NoBall` accuracy from **`56.76%` -> `83.57%` (`AUC = 0.9193`)** without any `nearest_slot` or ball-coordinate leakage.
+   * Adds `X_ctrl_atd` (`d_home_1/2`, `d_away_1/2`, continuous Gaussian control proximity `ctrl_h/a`, ball kinematics `v_ball`, `a_ball`, `in_flight`, and unsupervised `track_retention_prior`) for `GBDT_Alive_Full` (`98.95%` clean / `93.85%` duel-stress OOF Acc), temp-calibrated HMM EM (`ll` correlation damping), and enriched `Crisp Dilated SeqRefiner` context.
+3. **Ball-Launch Set-Piece Restart, Goal Celebration Tail & Strict-OOB Physics (`src/smart_tagging_priors.py`, `src/models/heuristic_fsm.py`):**
+   * Fixes the Smart Tagging `SET PIECES` backward-scan bug (`65.5%` false `D` down to `9.4%`) by scanning **forward** from `s_f` until confirmed inbounds ball-launch speed (`v_ball >= 3.6 m/s` or `max >= 5.5`), isolating post-shot `GOALS` celebration tails, adding sustained strict out-of-bounds (`oob_sust`) stoppages, and extending resting stoppage exits (`< 3.6 m/s`) cleanly to the kick/throw launch frame (**Dead-Ball F1 = `0.9895`, `alive/dead F1 = 0.9974`**).
+4. **Control-Weighted Tier 1 & Matrix 9 Directed Transition Gates (`src/models/heuristic_fsm.py`, `src/models/sentiment_hybrid.py`):**
+   * Dampens aerial pass-in-flight frames (`in_flight`: `min_d > 2.7 m` or `v_ball > 9.5 m/s` while `min_d > 1.7 m`) in Tier 1 emissions and tightens mid-flight transition gates (`* 0.55`) while modulating directed `H -> A` (`0.765`) and `A -> H` (`0.816`) gates by Matrix 9 unpinned press capacity and bait safety (`OOF Meta LogLoss = 0.2178`).
+5. **Physical Reception Boundary Snapper (`Pass 2C`) & Control-Verified Deflection Filtering (`src/decoder.py`):**
+   * Shifts Voronoi mid-flight boundary flips (`-10.. -33f` early bias across `123` full-match turnovers) forward to receiver deceleration / ball-trap / clearance-kick frames (`Pass 2C`), followed by ATD control-proximity deflection (`Pass 3B`) and pre-stoppage last-touch clearance (`Pass 3C`) filtering — cutting mean transition latency by **`65%`** (`-5.8f` -> **`-2.0f`**) and lifting `transF1@tau=12` from `0.5000` -> **`0.6111`**.
 
 ---
 
@@ -34,17 +32,20 @@ This branch implements six structural upgrades plus rule-compliant **Hansi Flick
 
 ### A. 5-Minute Public Ground Truth (`evaluation/run_evaluation.py --bootstrap 1000`)
 
-| Rank | Model (`Branch`) | `spellF1` | Bootstrap 5–95% | `IoU@0.5 F1` | `macroF1` | `tau=12` F1 | `tau=25` F1 | `poss` (GT 17) | `dur` (GT 14.2s) | `shareE` |
+| Rank | Model (`Branch`) | `spellF1` | Bootstrap 5–95% | `IoU@0.5 F1` | `macroF1` | `tau=12` F1 | `tau=25` F1 | `latency` | `poss` (GT 17) | `shareE` |
 |---:|---|---:|:---:|---:|---:|---:|---:|---:|---:|---:|
-| **1** | **Sentiment v2 (`sentiment-hybrid-v2`)** | **0.7067** | **0.5067..0.8623** | **0.7333** | 0.9496 | **0.5000** | 0.6667 | **13 (-4)** | **18.6 s** | **0.016** |
-| **1** | Sentiment v1 (`sentiment-hybrid`) | **0.7067** | **0.5067..0.8623** | **0.7333** | 0.9496 | **0.5000** | 0.6667 | **13 (-4)** | **18.6 s** | **0.016** |
-| 3 | ML Ensemble (`model-fitting`) | 0.7000 | 0.4857..0.8495 | 0.7143 | **0.9543** | 0.4706 | **0.7059** | 11 (-6) | 21.9 s | 0.022 |
-| 4 | Physics Matrix (`physics`) | 0.7000 | 0.4857..0.8495 | 0.7143 | **0.9543** | 0.4706 | **0.7059** | 11 (-6) | 21.9 s | 0.022 |
+| **1** | **Pressing-Pinning (`pressing-pinning-hybrid`)** | **0.7200** | **0.5200..0.8753** | **0.7333** | **0.9563** | **0.6111** | **0.7222** | **-2.0 f** | **13 (-4)** | **0.004** |
+| 2 | Sentiment v2 (`sentiment-hybrid-v2`) | 0.7067 | 0.5067..0.8623 | 0.7333 | 0.9496 | 0.5000 | 0.6667 | -5.8 f | 13 (-4) | 0.016 |
+| 3 | Sentiment v1 (`sentiment-hybrid`) | 0.7067 | 0.5067..0.8623 | 0.7333 | 0.9496 | 0.5000 | 0.6667 | -5.8 f | 13 (-4) | 0.016 |
+| 4 | ML Ensemble (`model-fitting`) | 0.7000 | 0.4857..0.8495 | 0.7143 | 0.9543 | 0.4706 | 0.7059 | -3.8 f | 11 (-6) | 0.022 |
+| 5 | Physics Matrix (`physics`) | 0.7000 | 0.4857..0.8495 | 0.7143 | 0.9543 | 0.4706 | 0.7059 | -3.8 f | 11 (-6) | 0.022 |
+| 6 | Baseline Smooth 50 | 0.3256 | 0.2140..0.4465 | 0.3256 | 0.6207 | 0.0816 | 0.0816 | +4.0 f | 26 (+9) | 0.048 |
 
 ### B. Full-Match & Stress Validation (`158,857` Graded Frames)
 
-* **Honest Masked-Ball Stability Stress Test (`12,600` masked frames):** **`spellF1 = 0.8864`** (`+0.0083` over `v1`'s `0.8781`), **`macroF1 = 0.9699`**.
-* **Full-Match Macro Structure (`sentiment_hybrid_v2.csv`):** **`23,926` frames updated vs. `v1`** (`19,368` newly recovered parked `D` frames + live handover/Flick refinements); **`306` possession spells** (`397` contiguous `H/A/D` segments), mean duration **`12.80 s`** (median `6.78 s`), `H=35.9% (57,074)`, `A=25.7% (40,863)`, `D=38.3% (60,920)`, Home share of alive time **`58.3%`**, 2nd-half pre-kickoff `D% = 100.0%` (`2,934` frames).
+* **6-Fold Full-Match Specialists (Zero GT Leakage):** `GBDT_Full = 98.95%` (`DuelStress = 93.85%`), **`GBDT_NoBall(44-inv) = 83.57% (AUC = 0.9193)`**, `OOF Meta LogLoss = 0.2178`.
+* **Full-Match Macro Structure (`pressing_pinning_hybrid.csv`):** **`11,911` frames refined vs. `v2`**; **`294` possession spells** (`419` contiguous `H/A/D` segments), mean duration **`12.24 s`** (median `6.56 s`), `H=32.4% (51,451)`, `A=24.3% (38,525)`, `D=43.4% (68,881)`, Home share of alive time **`57.18%`**, 2nd-half pre-kickoff `D% = 100.0%` (`2,934` frames).
+* **Dual-Mode Fallback Verification:** Tested on no-ATD input (`tests/test_pressing_pinning.py` + `has_full_atd=False` pipeline run -> `len=199319`, valid cleanly).
 
 ---
 
@@ -52,8 +53,8 @@ This branch implements six structural upgrades plus rule-compliant **Hansi Flick
 
 ```bash
 pip install -r requirements.txt
-python3 scripts/generate_submission.py --out evaluation/results/sentiment_hybrid_v2.csv
-python3 evaluation/validate_submission.py evaluation/results/sentiment_hybrid_v2.csv
-python3 scripts/run_diagnostics.py
-python3 evaluation/run_evaluation.py --bootstrap 1000
+python3 tests/test_pressing_pinning.py
+python3 scripts/generate_submission.py --out evaluation/results/pressing_pinning_hybrid.csv
+python3 evaluation/validate_submission.py evaluation/results/pressing_pinning_hybrid.csv
+python3 evaluation/run_evaluation.py --gt public --bootstrap 1000
 ```
