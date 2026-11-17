@@ -1,15 +1,18 @@
-"""Stage 3 (Tier 4): Match-Sentiment-Adaptive Hybrid Model (Physics + ML Fusion).
+"""Stage 3 (Tier 4): Match-Sentiment-Adaptive Hybrid Model (Physics + ML Fusion + Tactical Priors).
 
-Computes a continuous 5-dimensional Match Sentiment Tensor Psi_t at every frame from
-homography camera kinematics, duel contention entropy, flip rate, and ball occlusion:
-  - S_CALM_CONTROL       (0): Low entropy & calm/tripod-locked buildup -> Physics persistence dominates.
-  - S_CONTESTED_CHAOS    (1): High entropy & duel flip rate -> ML (GBDT_Alive + SeqRefiner + EM) dominates.
-  - S_VERTICAL_TRANSITION(2): High camera pan speed & acceleration -> Agile ML + Physics counter-attack fusion.
-  - S_OCCLUDED_FLIGHT    (3): Missing raw ball in live flight -> GBDT_Alive_NoBall + Homography bridge.
-  - S_STOPPAGE_RESET     (4): Wide-FOV reset / Goal-kick zoom / OOB / Walk-up -> Physics Stoppage Matrices.
+Computes a continuous Match Sentiment Tensor Psi_t plus Flick Tactical Press/Control and
+Player/Zone Retention Signals from homography camera kinematics, contention entropy, duel flips,
+and ball occlusion:
+  - S_CALM_CONTROL       (0): Low entropy & calm/tripod-locked buildup -> Physics + positional control.
+  - S_CONTESTED_CHAOS    (1): High entropy & duel flip rate -> Duel-robust ML dominates.
+  - S_VERTICAL_TRANSITION(2): High camera pan speed & acceleration -> Agile counter-attack fusion.
+  - S_OCCLUDED_FLIGHT    (3): Missing raw ball in live flight -> Contested handover bridge + NoBall ML.
+  - S_STOPPAGE_RESET     (4): Wide-FOV reset / Goal-kick zoom / OOB / Walk-up -> Physics Stoppage.
 """
 
 import numpy as np
+from scipy.optimize import minimize
+from sklearn.metrics import log_loss
 
 SENTIMENT_NAMES = (
     "CALM_CONTROL",
@@ -25,15 +28,18 @@ def _sigmoid(x):
 
 
 def compute_match_sentiment_tensor(features, regimes):
-    """Compute continuous Match Sentiment axes Psi_t and discrete dominant regime IDs."""
+    """Compute continuous Match Sentiment axes Psi_t, tactical Flick signals, and regime IDs."""
     ent = features["contention_entropy_2s"]
     flip = features["duel_flip_rate_2s"]
     v_cam = features["v_cam"]
     v_cam_2s = features["v_cam_mean_2s"]
     acc_cam = features["acc_cam"]
+    cam_x_h = features["cam_x_attack_h"]
+    vx_h = features["vx_attack_h"]
     raw_codes = features["raw_codes"]
     dead_mask = regimes["dead_ball_mask"]
     live_bridge = regimes["live_bridge_lock"]
+    contested_occl = regimes.get("contested_occl_mask", np.zeros(len(raw_codes), dtype=bool))
 
     # 1. Duel Chaos / Contention Sentiment psi_chaos in [0, 1]
     ent_gate = _sigmoid((ent - 0.50) / 0.14)
@@ -53,6 +59,30 @@ def compute_match_sentiment_tensor(features, regimes):
     # 5. Stoppage / Reset Sentiment psi_stoppage in {0, 1}
     psi_stoppage = dead_mask.astype(np.float64)
 
+    # 6. Hansi Flick Tactical & Positional Retention Signals:
+    # - High-line counter-press trap: Home pushes into mid/attacking half (cam_x > 0.38) while
+    #   Away has NOT broken behind the line (vx_attack_h > -0.75 m/s).
+    # - Counter-attack line break: Away breaks Flick's high line vertically (vx_attack_h < -1.05 m/s).
+    # - Player/Zone retention stability: track-level retention (when ATD present) + low-chaos control.
+    psi_high_press = (
+        _sigmoid((cam_x_h - 0.38) / 0.14)
+        * _sigmoid((vx_h + 0.75) / 0.35)
+        * (0.35 + 0.65 * psi_chaos)
+    )
+    psi_counter_break_a = _sigmoid((-vx_h - 1.05) / 0.35)
+
+    track_ret = features.get("track_retention_prior")
+    if features.get("has_full_atd", False) and track_ret is not None:
+        player_ret = np.clip((track_ret - 0.45) / 0.25, 0.0, 1.0)
+    else:
+        player_ret = 0.5
+    zone_stability = (
+        _sigmoid((0.55 - cam_x_h) / 0.18)
+        * (1.0 - 0.60 * psi_chaos)
+        * _sigmoid((1.0 - v_cam) / 0.35)
+    )
+    retention_h_stability = np.clip(0.55 * zone_stability + 0.45 * player_ret, 0.0, 1.0)
+
     # Categorical dominant sentiment label (0..4) for diagnostics & reporting
     dom = np.zeros(len(raw_codes), dtype=np.int8)  # default: 0 CALM_CONTROL
     dom[psi_tempo >= 0.52] = 2                     # 2 VERTICAL_TRANSITION
@@ -66,7 +96,121 @@ def compute_match_sentiment_tensor(features, regimes):
         "psi_tripod": psi_tripod,
         "psi_occl": psi_occl,
         "psi_stoppage": psi_stoppage,
+        "contested_occl": contested_occl,
+        "psi_high_press": psi_high_press,
+        "psi_counter_break_a": psi_counter_break_a,
+        "retention_h_stability": retention_h_stability,
         "dominant_sentiment": dom,
+    }
+
+
+def _fit_oof_meta_router_params(
+    logit_phys,
+    logit_gf,
+    logit_gnb,
+    logit_seq,
+    logit_em,
+    sentiment,
+    spec_cv_metrics,
+    seed=42,
+):
+    """Optimize sentiment fusion temperatures & Flick prior weight strictly via 6-fold OOF LogLoss.
+
+    Evaluated on clean + stress-corrupted (synthetic ball-dropout & chaotic duel attenuation)
+    live anchor samples across the 6 temporal CV blocks so stacking parameters never collapse
+    to 100%-memorized GBDT logits and never touch human evaluation labels.
+    """
+    if (
+        spec_cv_metrics is None
+        or "live_anchor_idx" not in spec_cv_metrics
+        or "y_anc" not in spec_cv_metrics
+    ):
+        return {
+            "w_chaos_boost": 0.36,
+            "w_occl_contested_ml": 0.50,
+            "beta_flick_prior": 0.22,
+            "w_noball_in_ml": 0.22,
+            "oof_meta_logloss": None,
+        }
+
+    anc_idx = spec_cv_metrics["live_anchor_idx"]
+    y_anc = spec_cv_metrics["y_anc"]          # 0=H, 1=A
+    b_anc = spec_cv_metrics["b_anc"]
+    y_h = (y_anc == 0).astype(np.float64)
+    pi_h = spec_cv_metrics["oof_pi_h_frame"][anc_idx]
+    base_h_odds = np.log(np.clip(pi_h / np.maximum(1.0 - pi_h, 1e-3), 0.70, 2.40))
+
+    lp_a = logit_phys[anc_idx]
+    lgf_a = logit_gf[anc_idx]
+    lgnb_a = logit_gnb[anc_idx]
+    lseq_a = logit_seq[anc_idx]
+    lem_a = logit_em[anc_idx]
+
+    ch_a = sentiment["psi_chaos"][anc_idx]
+    tm_a = sentiment["psi_tempo"][anc_idx]
+    tr_a = sentiment["psi_tripod"][anc_idx]
+    hp_a = sentiment["psi_high_press"][anc_idx]
+    cb_a = sentiment["psi_counter_break_a"][anc_idx]
+
+    # Build a stress-augmented training/validation target view on live anchors:
+    # 35% of samples simulate missing ball (using GBDT_NoBall + attenuated Phys/EM),
+    # 25% simulate chaotic ball confusion (attenuating raw ball dominance + spiking chaos).
+    rng = np.random.RandomState(seed + 19)
+    n_a = len(anc_idx)
+    u = rng.rand(n_a)
+    drop_m = u < 0.35
+    chaos_m = (u >= 0.35) & (u < 0.60)
+
+    lp_s = np.where(drop_m, 0.25 * lp_a, np.where(chaos_m, 0.55 * lp_a + rng.normal(0.0, 0.45, n_a), lp_a))
+    lgf_s = np.where(drop_m, lgnb_a, np.where(chaos_m, 0.55 * lgf_a + rng.normal(0.0, 0.55, n_a), lgf_a))
+    ch_s = np.where(chaos_m, np.maximum(ch_a, 0.75), ch_a)
+    flick_feat = (
+        base_h_odds * (0.45 * (0.4 + 0.6 * tr_a) + 0.30 * hp_a - 0.35 * cb_a)
+    )
+
+    unique_folds = np.unique(b_anc)
+    learned_folds = []
+    oof_probs = np.full(n_a, 0.5, dtype=np.float64)
+
+    def _forward_logit(params, idx_mask):
+        w_chaos, w_nb_ml, b_flick = params
+        active = np.maximum(ch_s[idx_mask], 0.75 * tm_a[idx_mask])
+        w_ml = np.clip(0.24 + w_chaos * active - 0.06 * tr_a[idx_mask], 0.16, 0.68)
+        w_gf = max(0.05, 0.72 - w_nb_ml - 0.18)
+        l_ml = w_gf * lgf_s[idx_mask] + w_nb_ml * lgnb_a[idx_mask] + 0.14 * lseq_a[idx_mask] + 0.14 * lem_a[idx_mask]
+        l_comb = (1.0 - w_ml) * lp_s[idx_mask] + w_ml * l_ml + b_flick * flick_feat[idx_mask]
+        return l_comb
+
+    init_p = np.array([0.36, 0.22, 0.22], dtype=np.float64)
+    bounds = [(0.18, 0.50), (0.10, 0.36), (0.00, 0.45)]
+
+    for fold in unique_folds:
+        tr_m = b_anc != fold
+        va_m = b_anc == fold
+
+        def _loss_fn(params):
+            lc = _forward_logit(params, tr_m)
+            p_h = _sigmoid(lc)
+            ll = -np.mean(
+                y_h[tr_m] * np.log(np.clip(p_h, 1e-6, 1.0))
+                + (1.0 - y_h[tr_m]) * np.log(np.clip(1.0 - p_h, 1e-6, 1.0))
+            )
+            reg = 0.025 * float(np.sum((params - init_p) ** 2))
+            return float(ll + reg)
+
+        res = minimize(_loss_fn, init_p, bounds=bounds, method="L-BFGS-B")
+        p_fold = res.x if res.success else init_p
+        learned_folds.append(p_fold)
+        oof_probs[va_m] = _sigmoid(_forward_logit(p_fold, va_m))
+
+    mean_p = np.mean(np.vstack(learned_folds), axis=0)
+    oof_ll = float(log_loss(y_anc, np.column_stack([oof_probs, 1.0 - oof_probs])))
+    return {
+        "w_chaos_boost": float(mean_p[0]),
+        "w_noball_in_ml": float(mean_p[1]),
+        "beta_flick_prior": float(mean_p[2]),
+        "w_occl_contested_ml": 0.50,
+        "oof_meta_logloss": oof_ll,
     }
 
 
@@ -79,12 +223,16 @@ def fuse_models_by_match_sentiment(
     oof_ha_full,
     oof_ha_noball,
     seq_log_probs,
+    spec_cv_metrics=None,
 ):
-    """Dynamically fuse Physics and ML predictions conditioned on Match Sentiment Psi_t.
+    """Dynamically fuse Physics and ML predictions via Match Sentiment Psi_t & Flick Tactical Priors.
 
-    Combines log-odds across Physics (Tier 1), Specialist ML (GBDT_Alive_Full / NoBall),
-    Dilated Temporal Sequence Refiner, and Unsupervised Baum-Welch EM using continuous
-    sentiment weights (w_phys(t), w_ml(t)), and generates sentiment-modulated HSMM gates.
+    Returns:
+        hybrid_log_probs: (N, 3) fused log-probabilities over {H, A, D}.
+        turnover_gate_ha: (N,) directed H -> A transition permeability multiplier.
+        turnover_gate_ah: (N,) directed A -> H counter-press recovery multiplier.
+        logit_fused:      (N,) signed H-vs-A log-odds (+ -> H, - -> A).
+        routing_summary:  dict of diagnostic routing & OOF meta-stacking weights.
     """
     n = len(features["raw_codes"])
     dead_mask = regimes["dead_ball_mask"]
@@ -92,6 +240,10 @@ def fuse_models_by_match_sentiment(
     psi_tempo = sentiment["psi_tempo"]
     psi_tripod = sentiment["psi_tripod"]
     psi_occl = sentiment["psi_occl"]
+    contested_occl = sentiment["contested_occl"]
+    psi_high_press = sentiment["psi_high_press"]
+    psi_counter_break_a = sentiment["psi_counter_break_a"]
+    ret_h = sentiment["retention_h_stability"]
 
     # 1. Extract alive H-vs-A log-odds from each model family
     p_t1 = np.exp(tier1_log_probs)
@@ -106,64 +258,120 @@ def fuse_models_by_match_sentiment(
     p_seq_h = np.clip(p_seq[:, 0] / np.maximum(p_seq[:, 0] + p_seq[:, 1], 1e-9), 1e-4, 1.0 - 1e-4)
     logit_seq = np.log(p_seq_h / (1.0 - p_seq_h))
 
-    # GBDT_Alive_Full & GBDT_Alive_NoBall class 0 is P(H), class 1 is P(A).
-    # Temperature-scale ML logits (T=2.2, clipped to [-3.2, +3.2]) so extreme anchor confidence
-    # never overrides Viterbi duration persistence on noisy 15-frame flickers.
     p_gf_h = np.clip(oof_ha_full[:, 0], 1e-3, 1.0 - 1e-3)
     logit_gbdt_full = np.clip(np.log(p_gf_h / (1.0 - p_gf_h)) / 2.2, -3.2, 3.2)
 
     p_gnb_h = np.clip(oof_ha_noball[:, 0], 1e-3, 1.0 - 1e-3)
-    logit_gbdt_noball = np.clip(np.log(p_gnb_h / (1.0 - p_gnb_h)) / 1.6, -2.5, 2.5)
+    logit_gbdt_noball = np.clip(np.log(p_gnb_h / (1.0 - p_gnb_h)) / 1.5, -2.5, 2.5)
 
     logit_seq_cal = np.clip(logit_seq / 2.0, -3.0, 3.0)
     logit_em_cal = np.clip(logit_em / 1.5, -2.8, 2.8)
 
-    # Composite ML alive log-odds when ball is visible vs missing:
-    logit_ml_visible = 0.62 * logit_gbdt_full + 0.18 * logit_seq_cal + 0.20 * logit_em_cal
-    logit_ml_occluded = 0.55 * logit_gbdt_noball + 0.20 * logit_seq_cal + 0.25 * logit_em_cal
+    # 2. Fit OOF Sentiment Meta-Parameters cleanly across 6 temporal folds
+    meta = _fit_oof_meta_router_params(
+        logit_phys=logit_phys,
+        logit_gf=logit_gbdt_full,
+        logit_gnb=logit_gbdt_noball,
+        logit_seq=logit_seq_cal,
+        logit_em=logit_em_cal,
+        sentiment=sentiment,
+        spec_cv_metrics=spec_cv_metrics,
+    )
+    w_nb_ml = meta["w_noball_in_ml"]
+    w_gf_ml = max(0.05, 0.72 - w_nb_ml - 0.16)
 
+    logit_ml_visible = (
+        w_gf_ml * logit_gbdt_full
+        + w_nb_ml * logit_gbdt_noball
+        + 0.14 * logit_seq_cal
+        + (1.0 - w_gf_ml - w_nb_ml - 0.14) * logit_em_cal
+    )
+    logit_ml_occluded = 0.56 * logit_gbdt_noball + 0.22 * logit_seq_cal + 0.22 * logit_em_cal
     logit_ml = np.where(psi_occl > 0.5, logit_ml_occluded, logit_ml_visible)
 
-    # 2. Match Sentiment Routing Gate w_ml(t) vs w_phys(t):
-    # - In Calm Buildup (psi_chaos ~ 0, psi_tripod high): Physics dominates (~0.75 vs ML ~0.25).
-    # - In Contested Chaos / Fast Transitions: ML weight rises to ~0.58 so ML resolves contested
-    #   high-entropy interior duels while preserving sharp boundary discipline.
-    # - In Occluded Live Flight: blend Physics Homography bridge (0.68) with ML NoBall (0.32).
+    # 3. Sentiment Routing Weight w_ml(t) vs w_phys(t):
+    # - Calm Control: Physics persistence dominates
+    # - Contested Chaos / Vertical Transition: OOF-learned w_chaos_boost elevates ML share
+    # - Occluded Flight (Same-Team): 0.68 Physics Bridge + 0.32 ML NoBall
+    # - Occluded Flight (Contested Handover pre != post): 0.50 Physics Handover + 0.50 ML NoBall
     active_chaos_or_tempo = np.maximum(psi_chaos, 0.75 * psi_tempo)
-    w_ml_visible = np.clip(0.24 + 0.34 * active_chaos_or_tempo - 0.06 * psi_tripod, 0.18, 0.58)
-    w_ml = np.where(psi_occl > 0.5, 0.32, w_ml_visible)
+    w_ml_visible = np.clip(
+        0.24 + meta["w_chaos_boost"] * active_chaos_or_tempo - 0.06 * psi_tripod,
+        0.16,
+        0.64,
+    )
+    w_ml_occl = np.where(contested_occl, meta["w_occl_contested_ml"], 0.32)
+    w_ml = np.where(psi_occl > 0.5, w_ml_occl, w_ml_visible)
     w_phys = 1.0 - w_ml
 
-    # Fused log-odds via Sentiment-Weighted Log-Opinion Pool
-    logit_fused = w_phys * logit_phys + w_ml * logit_ml
-    prob_h_given_alive = _sigmoid(logit_fused)
-    prob_a_given_alive = 1.0 - prob_h_given_alive
+    # 4. Hansi Flick Tactical Control & High-Press / Counter-Break Prior
+    if spec_cv_metrics is not None and "oof_pi_h_frame" in spec_cv_metrics:
+        pi_h = spec_cv_metrics["oof_pi_h_frame"]
+    else:
+        pi_h = np.full(n, 0.58, dtype=np.float64)
+    base_h_odds = np.log(np.clip(pi_h / np.maximum(1.0 - pi_h, 1e-3), 0.70, 2.40))
+    flick_prior = meta["beta_flick_prior"] * base_h_odds * (
+        0.45 * (0.4 + 0.6 * psi_tripod)
+        + 0.30 * psi_high_press
+        - 0.35 * psi_counter_break_a
+    )
 
-    # 3. Preserve Physics Dead-Ball mastery (D F1 = 0.9830) cleanly separated from alive team call
+    logit_fused = w_phys * logit_phys + w_ml * logit_ml + flick_prior
+
+    # 5. Construct 3-Class Emission Log-Probabilities
+    p_h_alive = _sigmoid(logit_fused)
+    p_a_alive = 1.0 - p_h_alive
+
     prob_d = np.where(dead_mask, 0.97, 0.008)
     prob_alive = 1.0 - prob_d
 
     probs = np.zeros((n, 3), dtype=np.float64)
-    probs[:, 0] = np.clip(prob_alive * prob_h_given_alive, 1e-6, 1.0)
-    probs[:, 1] = np.clip(prob_alive * prob_a_given_alive, 1e-6, 1.0)
+    probs[:, 0] = np.clip(prob_alive * p_h_alive, 1e-6, 1.0)
+    probs[:, 1] = np.clip(prob_alive * p_a_alive, 1e-6, 1.0)
     probs[:, 2] = np.clip(prob_d, 1e-6, 1.0)
     probs /= np.sum(probs, axis=1, keepdims=True)
+    hybrid_log_probs = np.log(probs)
 
-    # 4. Sentiment-Modulated HSMM Turnover Gate (bounded to [0.65, 1.52]):
-    # Opens turnover barriers during high-chaos/high-tempo transitions so authentic short counter-attacks
-    # survive Viterbi; tightens in calm tripod buildup to prevent fragmentation.
-    turnover_gate = np.clip(
+    # 6. Directed Asymmetric Turnover Gates modulated by Sentiment + Flick Tactics + Retention
+    base_gate = np.clip(
         0.85 + 0.45 * psi_chaos + 0.30 * psi_tempo - 0.30 * psi_tripod,
         0.65,
         1.52,
     )
+    # In contested missing-ball handovers, slightly ease transitions so NoBall can locate handover
+    base_gate = np.where(contested_occl, np.maximum(base_gate, 1.18), base_gate)
 
+    # Flick counter-press & high-retention stability protect Home against brief noisy drops unless
+    # Away cleanly breaks behind the high line (psi_counter_break_a)
+    break_guard = 1.0 - psi_counter_break_a
+    turnover_gate_ha = np.clip(
+        base_gate
+        * (1.0 - 0.14 * ret_h * break_guard - 0.08 * psi_high_press)
+        * (1.0 + 0.25 * psi_counter_break_a),
+        0.55,
+        1.75,
+    )
+    turnover_gate_ah = np.clip(
+        base_gate
+        * (1.0 + 0.12 * psi_high_press - 0.10 * psi_counter_break_a),
+        0.55,
+        1.75,
+    )
+
+    dom = sentiment["dominant_sentiment"]
     routing_summary = {
-        "mean_w_ml_all": float(np.mean(w_ml)),
-        "mean_w_ml_calm": float(np.mean(w_ml[sentiment["dominant_sentiment"] == 0])) if np.any(sentiment["dominant_sentiment"] == 0) else 0.0,
-        "mean_w_ml_chaos": float(np.mean(w_ml[sentiment["dominant_sentiment"] == 1])) if np.any(sentiment["dominant_sentiment"] == 1) else 0.0,
-        "mean_w_ml_tempo": float(np.mean(w_ml[sentiment["dominant_sentiment"] == 2])) if np.any(sentiment["dominant_sentiment"] == 2) else 0.0,
-        "mean_w_ml_occl": float(np.mean(w_ml[sentiment["dominant_sentiment"] == 3])) if np.any(sentiment["dominant_sentiment"] == 3) else 0.0,
+        "mean_w_ml_all": float(np.mean(w_ml[dom != 4])),
+        "mean_w_ml_calm": float(np.mean(w_ml[dom == 0])) if np.any(dom == 0) else 0.0,
+        "mean_w_ml_chaos": float(np.mean(w_ml[dom == 1])) if np.any(dom == 1) else 0.0,
+        "mean_w_ml_tempo": float(np.mean(w_ml[dom == 2])) if np.any(dom == 2) else 0.0,
+        "mean_w_ml_occl": float(np.mean(w_ml[dom == 3])) if np.any(dom == 3) else 0.0,
+        "mean_w_ml_contested_occl": float(np.mean(w_ml[contested_occl])) if np.any(contested_occl) else 0.0,
+        "mean_gate_ha": float(np.mean(turnover_gate_ha[dom != 4])),
+        "mean_gate_ah": float(np.mean(turnover_gate_ah[dom != 4])),
+        "meta_w_chaos_boost": meta["w_chaos_boost"],
+        "meta_w_noball_in_ml": meta["w_noball_in_ml"],
+        "meta_beta_flick_prior": meta["beta_flick_prior"],
+        "oof_meta_logloss": meta["oof_meta_logloss"],
     }
 
-    return np.log(probs), turnover_gate, logit_fused, routing_summary
+    return hybrid_log_probs, turnover_gate_ha, turnover_gate_ah, logit_fused, routing_summary

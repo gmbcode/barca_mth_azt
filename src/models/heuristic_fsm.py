@@ -36,7 +36,7 @@ def _majority_team(arr, default=0):
     return 0 if c0 >= c1 else 1
 
 
-def detect_physical_regimes(features, half_blocks):
+def detect_physical_regimes(features, half_blocks, split_contested_occl=False):
     """Classify missing-ball gaps and detect dead-ball stoppages across both halves."""
     raw_codes = features["raw_codes"].copy()
     n = len(raw_codes)
@@ -47,11 +47,13 @@ def detect_physical_regimes(features, half_blocks):
     fov_x = features["fov_x_m"]
     dfov_x = features["dfov_x_ms"]
     v_cam = features["v_cam"]
+    vx_attack_h = features["vx_attack_h"]
     duel_flip = features["duel_flip_rate_2s"]
 
     bridged_codes = raw_codes.copy()
     dead_ball_mask = np.zeros(n, dtype=bool)
     live_bridge_lock = np.zeros(n, dtype=bool)
+    contested_occl_mask = np.zeros(n, dtype=bool)
 
     # Cue 0: Hard pre-kickoff walk-up in 2nd half (110,808 .. 113,741) and Smart Tagging masks
     dead_ball_mask[110808:113742] = True
@@ -81,19 +83,47 @@ def detect_physical_regimes(features, half_blocks):
                 pre_team = _majority_team(bridged_codes[max(s_h, g_s - 15):g_s], default=post_team)
 
             if gap_len < 60:
-                # Short occlusion (< 2.4s): always bridge as live play
+                # Short occlusion (< 2.4s): bridge as live play (hand over kinematically if pre != post & long enough)
                 bridged_codes[g_s:g_e] = pre_team
                 live_bridge_lock[g_s:g_e] = True
+                if split_contested_occl and pre_team != post_team:
+                    contested_occl_mask[g_s:g_e] = True
             else:
-                # Long missing-ball gap (>= 2.4s): check camera look-point displacement & pitch zone
+                # Long missing-ball gap (>= 2.4s): check camera look-point displacement, pitch zone & tripod stalls
                 disp_m = float(np.hypot(cx_m[g_e - 1] - cx_m[g_s], cy_m[g_e - 1] - cy_m[g_s]))
                 mean_cx = float(np.mean(cx[g_s:g_e]))
                 in_deep_box = (mean_cx < 0.20) or (mean_cx > 0.80)
+                tripod_frac = float(np.mean(v_cam[g_s:g_e] < 0.14))
+                mean_v_gap = float(np.mean(v_cam[g_s:g_e]))
+                parked_stoppage = split_contested_occl and (
+                    (gap_len >= 400 and tripod_frac >= 0.65 and mean_v_gap < 0.65)
+                    or (gap_len >= 1000 and tripod_frac >= 0.60 and mean_v_gap < 0.80)
+                )
 
-                if disp_m >= 7.0 and not in_deep_box:
+                if disp_m >= 7.0 and not in_deep_box and not parked_stoppage:
                     # Active downfield camera progression -> ball is in live flight / progression!
-                    bridged_codes[g_s:g_e] = pre_team
                     live_bridge_lock[g_s:g_e] = True
+                    if split_contested_occl and pre_team != post_team:
+                        contested_occl_mask[g_s:g_e] = True
+                        s_post = 1.0 if post_team == 0 else -1.0
+                        # Check for sustained forward surge in post_team's attacking direction
+                        dir_vel = vx_attack_h[g_s:g_e] * s_post
+                        sustained = dir_vel > 0.55
+                        # Find runs of >= 20 frames pushing toward post_team's goal with net progression
+                        t_handover = g_e
+                        for rs_s, rs_e, rs_v in _contiguous_runs(sustained.astype(np.int8)):
+                            if rs_v == 1 and (rs_e - rs_s) >= 20:
+                                onset_k = rs_s
+                                while onset_k > 0 and dir_vel[onset_k - 1] > 0.25:
+                                    onset_k -= 1
+                                if float(np.mean(dir_vel[onset_k:])) > 0.25:
+                                    t_handover = g_s + onset_k
+                                    break
+                        bridged_codes[g_s:t_handover] = pre_team
+                        if t_handover < g_e:
+                            bridged_codes[t_handover:g_e] = post_team
+                    else:
+                        bridged_codes[g_s:g_e] = pre_team
                 else:
                     # Stationary / local camera or deep corner/box -> Dead Ball stoppage (D)!
                     d_s = g_s
@@ -185,6 +215,7 @@ def detect_physical_regimes(features, half_blocks):
         "bridged_codes": bridged_codes,
         "dead_ball_mask": dead_ball_mask,
         "live_bridge_lock": live_bridge_lock,
+        "contested_occl_mask": contested_occl_mask,
         "stoppage_entry_gate": stoppage_entry_gate,
         "stoppage_exit_gate": stoppage_exit_gate,
         "turnover_gate": turnover_gate,
@@ -228,6 +259,9 @@ def compute_tier1_emission_log_probs(features, regimes):
     )
 
     log_odds_ha = np.log((p_h_local + 0.06) / (p_a_local + 0.06)) + st_net + 0.15 * log_area_ratio
+    contested_occl = regimes.get("contested_occl_mask")
+    if contested_occl is not None:
+        log_odds_ha = np.where(contested_occl, 0.55 * log_odds_ha, log_odds_ha)
     prob_h_given_alive = 1.0 / (1.0 + np.exp(-np.clip(log_odds_ha, -12.0, 12.0)))
     prob_a_given_alive = 1.0 - prob_h_given_alive
 

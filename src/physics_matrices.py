@@ -561,6 +561,8 @@ def build_time_inhomogeneous_transition_matrices(
     turnover_gate,
     stay_alive_penalty=5.6,
     stay_dead_penalty=6.8,
+    turnover_gate_ha=None,
+    turnover_gate_ah=None,
 ):
     """Construct the frame-dynamic 3x3 log-transition tensor A_t in R^{N x 3 x 3}.
 
@@ -574,10 +576,11 @@ def build_time_inhomogeneous_transition_matrices(
     A_t[:, 1, 1] = 0.0
     A_t[:, 2, 2] = 0.0
 
-    # H <-> A transitions modulated by turnover_gate in [0.25, 2.5]
-    ha_cost = -stay_alive_penalty / np.clip(turnover_gate, 0.20, 3.0)
-    A_t[:, 0, 1] = ha_cost
-    A_t[:, 1, 0] = ha_cost
+    # H -> A and A -> H transitions (supports symmetric turnover_gate or Flick asymmetric gates)
+    g_ha = turnover_gate if turnover_gate_ha is None else turnover_gate_ha
+    g_ah = turnover_gate if turnover_gate_ah is None else turnover_gate_ah
+    A_t[:, 0, 1] = -stay_alive_penalty / np.clip(g_ha, 0.20, 3.0)
+    A_t[:, 1, 0] = -stay_alive_penalty / np.clip(g_ah, 0.20, 3.0)
 
     # H/A -> D transitions: heavily locked (-18.0) during live aerial bridges,
     # lowered when stoppage_entry_gate > 1.0

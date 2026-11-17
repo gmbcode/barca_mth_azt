@@ -233,6 +233,57 @@ def extract_physics_feature_dict(stage1_data, st_priors):
     ball_feature_indices = np.arange(0, 42, dtype=np.int32)
     noball_feature_indices = np.arange(42, 88, dtype=np.int32)
 
+    # Half-invariant 22-feature Trajectory, Territory Progression & Velocity Reversal Matrix (NoBall)
+    idx_all = np.arange(n)
+    vx_cs = np.concatenate(([0.0], np.cumsum(vx_attack_h, dtype=np.float64)))
+
+    def _pmean(cs, w):
+        lo = np.maximum(0, idx_all - w)
+        hi = idx_all + 1
+        return (cs[hi] - cs[lo]) / np.maximum(hi - lo, 1).astype(np.float64)
+
+    def _fmean(cs, w):
+        lo = idx_all
+        hi = np.minimum(n, idx_all + w + 1)
+        return (cs[hi] - cs[lo]) / np.maximum(hi - lo, 1).astype(np.float64)
+
+    def _pdisp(w):
+        return cam_x_attack_h - cam_x_attack_h[np.clip(idx_all - w, 0, n - 1)]
+
+    def _fdisp(w):
+        return cam_x_attack_h[np.clip(idx_all + w, 0, n - 1)] - cam_x_attack_h
+
+    dx_attack_1s = _pdisp(25)
+    dx_attack_3s = _pdisp(75)
+    dx_attack_6s = _pdisp(150)
+    vx_rev_1s = (_fmean(vx_cs, 15) - _pmean(vx_cs, 15)) / 10.0
+    vx_rev_3s = (_fmean(vx_cs, 40) - _pmean(vx_cs, 40)) / 10.0
+
+    X_noball_inv = np.column_stack([
+        cam_x_attack_h,
+        vx_attack_h / 10.0,
+        v_cam / 10.0,
+        cam_k["acc_mag_smooth"] / 25.0,
+        v_cam_mean_1s / 10.0,
+        v_cam_mean_2s / 10.0,
+        v_cam_mean_5s / 10.0,
+        tripod_frac_2s,
+        tripod_frac_5s,
+        dist_goal_line_norm,
+        dist_touchline_norm,
+        dx_attack_1s,
+        dx_attack_3s,
+        dx_attack_6s,
+        _fdisp(25),
+        _fdisp(75),
+        _pmean(vx_cs, 25) / 10.0,
+        _fmean(vx_cs, 25) / 10.0,
+        _pmean(vx_cs, 75) / 10.0,
+        _fmean(vx_cs, 75) / 10.0,
+        vx_rev_1s,
+        vx_rev_3s,
+    ]).astype(np.float32)
+
     features = {
         "raw_codes": raw_codes,
         "cam_x_norm": pose["cam_x_norm"],
@@ -241,6 +292,12 @@ def extract_physics_feature_dict(stage1_data, st_priors):
         "cam_y_m": pose["cam_y_m"],
         "cam_x_attack_h": cam_x_attack_h,
         "vx_attack_h": vx_attack_h,
+        "v_cam_mean_1s": v_cam_mean_1s,
+        "dx_attack_1s": dx_attack_1s,
+        "dx_attack_3s": dx_attack_3s,
+        "dx_attack_6s": dx_attack_6s,
+        "vx_rev_1s": vx_rev_1s,
+        "vx_rev_3s": vx_rev_3s,
         "fov_x_m": fov_x,
         "fov_y_m": fov_y,
         "dfov_x_ms": dfov_x,
@@ -273,7 +330,10 @@ def extract_physics_feature_dict(stage1_data, st_priors):
         "set_piece_pre_kick_d": st_priors["set_piece_pre_kick_d"],
         "set_piece_restart_team": st_priors["set_piece_restart_team"],
         "goal_dead_mask": st_priors["goal_dead_mask"],
+        "has_full_atd": bool(atd.get("has_full_atd", False)),
+        "track_retention_prior": atd.get("track_retention_prior", np.full(n, 0.5, dtype=np.float64)),
         "X_full": X_full,
+        "X_noball_inv": X_noball_inv,
         "ball_feature_indices": ball_feature_indices,
         "noball_feature_indices": noball_feature_indices,
     }

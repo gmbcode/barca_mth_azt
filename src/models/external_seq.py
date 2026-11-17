@@ -34,7 +34,10 @@ def build_dilated_temporal_context(prob_seq, features, offsets=DILATED_OFFSETS):
         shifted_idx = np.clip(idx + delta, 0, n - 1)
         dilated_cols.append(log_p[shifted_idx])
 
-    # Concatenate key ball-independent kinematic regime signals
+    # Concatenate key ball-independent kinematic regime signals (+ trajectory progression/reversal if present)
+    extra_kin = []
+    if "dx_attack_3s" in features and "vx_rev_1s" in features:
+        extra_kin = [features["dx_attack_3s"], features["vx_rev_1s"]]
     kin_context = np.column_stack([
         features["cam_x_attack_h"],
         features["vx_attack_h"] / 10.0,
@@ -46,6 +49,7 @@ def build_dilated_temporal_context(prob_seq, features, offsets=DILATED_OFFSETS):
         features["wide_fov_frac_5s"],
         features["dist_goal_line_norm"],
         features["st_net_log_odds"],
+        *extra_kin,
     ])
     dilated_cols.append(kin_context)
     return np.hstack(dilated_cols).astype(np.float32)
@@ -118,6 +122,7 @@ def fit_and_predict_stage2_temporal_refiner(
     seed=42,
     offsets=DILATED_OFFSETS,
     n_smooth_steps=6,
+    spike_noise_rate=0.0,
 ):
     """Train the Stage-2 Dilated Temporal Neural Refiner with Sim2Real 41% Ball-Dropout."""
     n = len(stage1_probs)
@@ -127,12 +132,21 @@ def fit_and_predict_stage2_temporal_refiner(
     real_missing = (features["raw_codes"] == 2)[:, None]
     eff_stage1_probs = np.where(real_missing, noball_probs, stage1_probs)
 
-    # Build Sim2Real corrupted input sequence for training (simulating 41% extra ball dropout)
+    # Build Sim2Real corrupted input sequence for training (simulating 41% extra ball dropout
+    # + optional short deflection spike flips so the refiner learns to rely on dilated consensus)
     corrupted_stage1_probs = np.where(
         (real_missing[:, 0] | synth_drop_mask)[:, None],
         noball_probs,
         stage1_probs,
-    )
+    ).copy()
+    if spike_noise_rate > 0.0:
+        rng_sp = np.random.RandomState(seed + 77)
+        live_idx = np.flatnonzero(graded_mask & (~real_missing[:, 0]))
+        n_spikes = int(len(live_idx) * spike_noise_rate / 10.0)
+        for st in rng_sp.choice(live_idx, size=max(1, n_spikes), replace=False):
+            sp_len = int(rng_sp.randint(5, 17))
+            ed = min(n, st + sp_len)
+            corrupted_stage1_probs[st:ed, [0, 1]] = corrupted_stage1_probs[st:ed, [1, 0]]
 
     X_seq_clean = build_dilated_temporal_context(eff_stage1_probs, features, offsets=offsets)
     X_seq_corrupt = build_dilated_temporal_context(corrupted_stage1_probs, features, offsets=offsets)
@@ -147,6 +161,7 @@ def fit_and_predict_stage2_temporal_refiner(
     half2_all = ~half1_all
 
     refined_probs = np.zeros((n, 3), dtype=np.float64)
+    refined_probs_corrupt = np.zeros((n, 3), dtype=np.float64)
 
     for train_anc_mask, val_all_mask, fold_seed in [
         (half1_anc, half2_all, seed + 1),
@@ -169,6 +184,7 @@ def fit_and_predict_stage2_temporal_refiner(
             warnings.simplefilter("ignore", category=ConvergenceWarning)
             mlp.fit(X_tr, y_tr)
         refined_probs[val_all_mask] = mlp.predict_proba(X_seq_clean[val_all_mask])
+        refined_probs_corrupt[val_all_mask] = mlp.predict_proba(X_seq_corrupt[val_all_mask])
 
     log_refined = np.log(np.clip(refined_probs, 1e-6, 1.0))
     log_smoothed = apply_truncated_temporal_mse_smoothing(
@@ -176,4 +192,9 @@ def fit_and_predict_stage2_temporal_refiner(
     )
 
     oof_acc_seq = float(accuracy_score(y_anc, np.argmax(refined_probs[anchor_idx], axis=1)))
-    return log_smoothed, {"oof_acc_seq_refiner": oof_acc_seq, "sim2real_drop_rate": float(synth_drop_mask[graded_mask].mean())}
+    oof_acc_seq_stress = float(accuracy_score(y_anc, np.argmax(refined_probs_corrupt[anchor_idx], axis=1)))
+    return log_smoothed, {
+        "oof_acc_seq_refiner": oof_acc_seq,
+        "oof_acc_seq_stress": oof_acc_seq_stress,
+        "sim2real_drop_rate": float(synth_drop_mask[graded_mask].mean()),
+    }

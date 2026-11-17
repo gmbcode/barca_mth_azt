@@ -58,6 +58,7 @@ def stream_parse_atd_raw(raw_path, team_of_track, n_frames, pitch=(105.3, 68.0))
     d_home_2 = np.full(n_frames, np.inf, dtype=np.float64)
     d_away_1 = np.full(n_frames, np.inf, dtype=np.float64)
     d_away_2 = np.full(n_frames, np.inf, dtype=np.float64)
+    nearest_slot = np.full(n_frames, -1, dtype=np.int16)
 
     mean_speed_all = np.full(n_frames, np.nan, dtype=np.float64)
     p90_speed_all = np.full(n_frames, np.nan, dtype=np.float64)
@@ -139,6 +140,8 @@ def stream_parse_atd_raw(raw_path, team_of_track, n_frames, pitch=(105.3, 68.0))
 
             if b_seen and np.any(valid_p):
                 dists = np.hypot(px - bx, py - by)
+                valid_dists = np.where(valid_p, dists, np.inf)
+                nearest_slot[f_idx] = int(np.argmin(valid_dists))
                 dh = np.sort(np.where(vh, dists, np.inf))
                 da = np.sort(np.where(va, dists, np.inf))
                 d_home_1[f_idx] = dh[0]
@@ -147,11 +150,27 @@ def stream_parse_atd_raw(raw_path, team_of_track, n_frames, pitch=(105.3, 68.0))
                 d_away_2[f_idx] = da[1] if len(da) > 1 else np.inf
                 raw_codes[f_idx] = 0 if dh[0] <= da[0] else 1
 
+    # Unsupervised algorithmic player ball-retention propensity per track slot (zero human labels):
+    # fraction of frames a track keeps team possession continuity +20f after initial touch
+    slot_retention = np.full(n_slots, 0.5, dtype=np.float64)
+    valid_slots = (nearest_slot >= 0) & (raw_codes < 2)
+    if np.any(valid_slots):
+        fut_idx = np.minimum(np.arange(n_frames) + 20, n_frames - 1)
+        retained = valid_slots & (raw_codes[fut_idx] == raw_codes)
+        for s_idx in range(n_slots):
+            ms = valid_slots & (nearest_slot == s_idx)
+            cnt = int(np.sum(ms))
+            if cnt >= 25:
+                slot_retention[s_idx] = (float(np.sum(retained & ms)) + 5.0) / (float(cnt) + 10.0)
+    track_retention_prior = np.where(nearest_slot >= 0, slot_retention[np.maximum(nearest_slot, 0)], 0.5)
+
     return {
         "has_full_atd": True,
         "ball_x_m": ball_x_m,
         "ball_y_m": ball_y_m,
         "raw_codes": raw_codes,
+        "nearest_slot": nearest_slot,
+        "track_retention_prior": track_retention_prior,
         "d_home_1": d_home_1,
         "d_home_2": d_home_2,
         "d_away_1": d_away_1,
@@ -242,6 +261,8 @@ def load_stage1_data(game=GAME, data_dir=None):
             "mean_speed_all": np.clip(0.8 * cam_kalman["speed_smooth"] + 1.5, 0.8, 6.0),
             "p90_speed_all": np.clip(1.4 * cam_kalman["speed_smooth"] + 2.5, 1.2, 9.0),
             "log_area_ratio": np.zeros(n_frames, dtype=np.float64),
+            "nearest_slot": np.full(n_frames, -1, dtype=np.int16),
+            "track_retention_prior": np.full(n_frames, 0.5, dtype=np.float64),
         }
 
     # 3. Compute Matrix 7: Multi-Scale Temporal Evidence & Contention Entropy Matrix (E_t)

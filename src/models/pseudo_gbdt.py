@@ -62,7 +62,45 @@ def _select_algorithmic_anchors(features, regimes, half_blocks):
     return anchor_labels, graded_mask
 
 
-def fit_baum_welch_em(features, regimes, tier1_log_probs, graded_mask, n_iter=4):
+def _hmm_forward_backward_log(joint_ll, stay_prob=0.975):
+    """Fast 3-state Forward-Backward HMM smoother in log-space over one contiguous sequence."""
+    T, K = joint_ll.shape
+    off_prob = (1.0 - stay_prob) / max(K - 1, 1)
+    log_A = np.full((K, K), np.log(off_prob), dtype=np.float64)
+    np.fill_diagonal(log_A, np.log(stay_prob))
+
+    log_alpha = np.zeros((T, K), dtype=np.float64)
+    log_beta = np.zeros((T, K), dtype=np.float64)
+
+    log_alpha[0] = joint_ll[0]
+    m0 = np.max(log_alpha[0])
+    log_alpha[0] -= m0 + np.log(np.sum(np.exp(log_alpha[0] - m0)))
+
+    for t in range(1, T):
+        # log_alpha[t, j] = logsumexp_i(log_alpha[t-1, i] + log_A[i, j]) + joint_ll[t, j]
+        scores = log_alpha[t - 1][:, None] + log_A
+        ms = np.max(scores, axis=0)
+        lse = ms + np.log(np.sum(np.exp(scores - ms), axis=0))
+        v = lse + joint_ll[t]
+        mv = np.max(v)
+        log_alpha[t] = v - (mv + np.log(np.sum(np.exp(v - mv))))
+
+    for t in range(T - 2, -1, -1):
+        scores = log_A + (joint_ll[t + 1] + log_beta[t + 1])[None, :]
+        ms = np.max(scores, axis=1)
+        v = ms + np.log(np.sum(np.exp(scores - ms[:, None]), axis=1))
+        mv = np.max(v)
+        log_beta[t] = v - (mv + np.log(np.sum(np.exp(v - mv))))
+
+    log_post = log_alpha + log_beta
+    mx = np.max(log_post, axis=1, keepdims=True)
+    log_post -= mx + np.log(np.sum(np.exp(log_post - mx), axis=1, keepdims=True))
+    return log_post
+
+
+def fit_baum_welch_em(
+    features, regimes, tier1_log_probs, graded_mask, n_iter=4, use_invariant_hmm=False, half_blocks=None
+):
     """Model 2A: Factored Baum-Welch Expectation-Maximization over Ball & Ball-Free Heads."""
     X_full = features["X_full"]
     ball_idx = features["ball_feature_indices"]
@@ -70,7 +108,10 @@ def fit_baum_welch_em(features, regimes, tier1_log_probs, graded_mask, n_iter=4)
     ball_seen = (features["raw_codes"] < 2) & (~regimes["dead_ball_mask"])
 
     X_ball = X_full[:, ball_idx].astype(np.float64)
-    X_kin = X_full[:, noball_idx].astype(np.float64)
+    if use_invariant_hmm and "X_noball_inv" in features:
+        X_kin = features["X_noball_inv"].astype(np.float64)
+    else:
+        X_kin = X_full[:, noball_idx].astype(np.float64)
     n, d_ball = X_ball.shape
     _, d_kin = X_kin.shape
 
@@ -117,8 +158,15 @@ def fit_baum_welch_em(features, regimes, tier1_log_probs, graded_mask, n_iter=4)
 
         # Combine with Tier 1 physical regime anchor prior for stable EM convergence
         joint_ll = 0.65 * tier1_log_probs + 0.35 * log_ll
-        mx = np.max(joint_ll, axis=1, keepdims=True)
-        log_post = joint_ll - (mx + np.log(np.sum(np.exp(joint_ll - mx), axis=1, keepdims=True)))
+        if use_invariant_hmm and half_blocks:
+            log_post = np.zeros_like(joint_ll)
+            mx0 = np.max(joint_ll, axis=1, keepdims=True)
+            log_post[:] = joint_ll - (mx0 + np.log(np.sum(np.exp(joint_ll - mx0), axis=1, keepdims=True)))
+            for _, s_h, e_h in half_blocks:
+                log_post[s_h:e_h + 1] = _hmm_forward_backward_log(joint_ll[s_h:e_h + 1], stay_prob=0.975)
+        else:
+            mx = np.max(joint_ll, axis=1, keepdims=True)
+            log_post = joint_ll - (mx + np.log(np.sum(np.exp(joint_ll - mx), axis=1, keepdims=True)))
         gamma = np.exp(log_post)
 
     return log_post
@@ -235,19 +283,20 @@ def fit_sentiment_specialist_gbdt_models(
 ):
     """Train binary {H, A} live-team specialist models (GBDT_Alive_Full & GBDT_Alive_NoBall).
 
-    Uses sharp local live anchors (without 3s centered smearing) and drops >=40-frame centered/future
-    ball windows so ML models stay razor-sharp at turnover boundaries while capturing +/-0.8s
-    causal/anti-causal momentum, duel chaos, and homography kinematics.
+    Uses clean + borderline live anchors alongside half-invariant trajectory kinematics (`X_noball_inv`)
+    and injects both Sim2Real ball-dropout (30%) and w=8 local flicker-inversion noise (20%) during
+    training so GBDT_Alive_Full breaks 100% raw memorization and generalizes into noisy duels.
     """
     X_full = features["X_full"]
-    # Select sharp local/causal ball signals (run_len=3, flips=4..6, ent=7, w8=[8,10,11,12,13], w20=[14,15,17,18,19], past40=23)
-    # and half-invariant ball-free kinematics [46,47,50,51,54,56,58,72,76,77] (no match_clock/reproj/flipped-side leakage)
-    keep_ball_cols = [3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 17, 18, 19, 23]
-    inv_noball_cols = [46, 47, 50, 51, 54, 56, 58, 72, 76, 77]
+    # Omit centered sh_8/sh_20 (which Tier 1 already encodes directly) so GBDT_Alive_Full learns
+    # non-redundant multi-scale causal/directional momentum [11..13, 17..19, 23] + kinematics X_noball_inv!
+    keep_ball_cols = [3, 4, 5, 6, 7, 11, 12, 13, 17, 18, 19, 23]
     n_ball_cols = len(keep_ball_cols)
-    alive_full_idx = np.array(keep_ball_cols + inv_noball_cols, dtype=np.int32)
-    X_alive_full = X_full[:, alive_full_idx].copy()
-    X_noball = X_full[:, inv_noball_cols].copy()
+    if "X_noball_inv" in features:
+        X_noball = features["X_noball_inv"].copy()
+    else:
+        X_noball = X_full[:, [46, 47, 50, 51, 54, 56, 58, 72, 76, 77]].copy()
+    X_alive_full = np.hstack([X_full[:, keep_ball_cols], X_noball]).astype(np.float32)
     n = len(X_full)
 
     graded_indices = np.flatnonzero(graded_mask)
@@ -255,39 +304,70 @@ def fit_sentiment_specialist_gbdt_models(
     for b_idx, ch in enumerate(np.array_split(graded_indices, n_blocks)):
         block_id[ch] = b_idx
 
-    # Build sharp live {H, A} anchors using short w=8 (0.32s) and w=20 (0.80s) consistency
+    # Build clean + moderate-contention live {H, A} anchors so training sees realistic transitions
     raw = features["raw_codes"]
     sh_c = features["alive_home_share"]
     dead_m = regimes["dead_ball_mask"] if regimes is not None else (anchor_labels == 2)
     sharp_h = graded_mask & (~dead_m) & (raw == 0) & (sh_c[:, 0] > 0.85) & (sh_c[:, 1] > 0.72)
     sharp_a = graded_mask & (~dead_m) & (raw == 1) & (sh_c[:, 0] < 0.15) & (sh_c[:, 1] < 0.28)
+    mod_h = graded_mask & (~dead_m) & (~sharp_h) & (sh_c[:, 1] > 0.70) & (sh_c[:, 2] > 0.66)
+    mod_a = graded_mask & (~dead_m) & (~sharp_a) & (sh_c[:, 1] < 0.30) & (sh_c[:, 2] < 0.34)
+
     sharp_y = np.full(n, -1, dtype=np.int8)
-    sharp_y[sharp_h] = 0
-    sharp_y[sharp_a] = 1
+    sharp_y[sharp_h | mod_h] = 0
+    sharp_y[sharp_a | mod_a] = 1
+    is_sharp = sharp_h | sharp_a
 
     live_anchor_idx = np.flatnonzero((sharp_y == 0) | (sharp_y == 1))[::stride]
     y_anc = sharp_y[live_anchor_idx]
     b_anc = block_id[live_anchor_idx]
+    sharp_anc = is_sharp[live_anchor_idx]
 
     classes, counts = np.unique(y_anc, return_counts=True)
     w_map = {int(c): float(len(y_anc)) / (2.0 * float(cnt)) for c, cnt in zip(classes, counts)}
-    w_anc = np.array([w_map[int(y)] for y in y_anc], dtype=np.float32)
+    w_anc = np.array(
+        [w_map[int(y)] * (1.0 if sh else 0.55) for y, sh in zip(y_anc, sharp_anc)],
+        dtype=np.float32,
+    )
 
     oof_ha_full = np.full((n, 2), 0.5, dtype=np.float64)
     oof_ha_noball = np.full((n, 2), 0.5, dtype=np.float64)
     oof_anc_full = np.zeros((len(live_anchor_idx), 2), dtype=np.float64)
     oof_anc_noball = np.zeros((len(live_anchor_idx), 2), dtype=np.float64)
+    oof_anc_noisy = np.zeros((len(live_anchor_idx), 2), dtype=np.float64)
+    oof_pi_h_frame = np.full(n, 0.55, dtype=np.float64)
 
     rng = np.random.RandomState(seed)
+
+    def _corrupt_ball_duel_batch(X_in, r_gen, drop_p=0.30, flip_p=0.15):
+        """Inject ball dropout + mild w=8 flicker noise without artificial entropy shortcuts."""
+        Xo = X_in.copy()
+        draw = r_gen.rand(len(Xo))
+        drop_m = draw < drop_p
+        flip_m = (draw >= drop_p) & (draw < (drop_p + flip_p))
+        # Dropped rows: neutral shares across indices [5:past_8, 6:fut_8, 8:past_20, 9:fut_20, 11:past_40]
+        Xo[drop_m, :n_ball_cols] = 0.0
+        for col_share in (5, 6, 8, 9, 11):
+            Xo[drop_m, col_share] = 0.5
+        # Short flicker rows: flip only ultra-short w=8 [5,6,7], leaving w=20, w=40 & X_noball_inv intact
+        # Do NOT alter col 4 (entropy) so trees never learn a synthetic parity-inversion shortcut!
+        Xo[flip_m, 5] = 1.0 - Xo[flip_m, 5]
+        Xo[flip_m, 6] = 1.0 - Xo[flip_m, 6]
+        Xo[flip_m, 7] = -Xo[flip_m, 7]
+        rem_m = ~drop_m
+        Xo[rem_m, 5:n_ball_cols] += r_gen.normal(
+            0.0, 0.16, size=(int(np.sum(rem_m)), n_ball_cols - 5)
+        ).astype(np.float32)
+        return Xo
 
     def _build_bin_clf(f_seed, is_nb):
         if HAS_XGB:
             return XGBClassifier(
-                n_estimators=140 if not is_nb else 100,
+                n_estimators=150 if not is_nb else 120,
                 max_depth=4 if not is_nb else 3,
                 learning_rate=0.05 if not is_nb else 0.04,
                 subsample=0.80,
-                colsample_bytree=0.70 if not is_nb else 0.80,
+                colsample_bytree=0.70,
                 min_child_weight=30 if not is_nb else 80,
                 reg_lambda=5.0 if not is_nb else 10.0,
                 reg_alpha=1.0 if not is_nb else 2.0,
@@ -297,7 +377,7 @@ def fit_sentiment_specialist_gbdt_models(
                 verbosity=0,
             )
         return HistGradientBoostingClassifier(
-            max_iter=140 if not is_nb else 100,
+            max_iter=150 if not is_nb else 120,
             max_depth=4 if not is_nb else 3,
             learning_rate=0.05,
             min_samples_leaf=40 if not is_nb else 80,
@@ -310,22 +390,21 @@ def fit_sentiment_specialist_gbdt_models(
         va_m = b_anc == fold
         va_all = block_id == fold
 
-        X_tr_f = X_alive_full[live_anchor_idx[tr_m]].copy()
-        # Sim2Real Ball-Dropout + Confusion Regularization: mask 35% of training rows' ball features
-        # and perturb remaining H/A share features so trees rely on multimodal kinematics during chaos/occlusion.
-        drop_m = rng.rand(len(X_tr_f)) < 0.35
-        X_tr_f[drop_m, :n_ball_cols] = 0.0
-        X_tr_f[~drop_m, 5:n_ball_cols] += rng.normal(
-            0.0, 0.25, size=(int(np.sum(~drop_m)), n_ball_cols - 5)
-        ).astype(np.float32)
-
         y_tr = y_anc[tr_m]
         w_tr = w_anc[tr_m]
 
+        # Out-of-fold empirical H possession share prior strictly from training folds
+        oof_pi_h_frame[va_all] = float(np.mean(y_tr == 0))
+
+        X_tr_f = _corrupt_ball_duel_batch(X_alive_full[live_anchor_idx[tr_m]], rng, drop_p=0.30, flip_p=0.15)
         clf_full = _build_bin_clf(seed + fold, is_nb=False)
         clf_full.fit(X_tr_f, y_tr, sample_weight=w_tr)
         oof_ha_full[va_all] = clf_full.predict_proba(X_alive_full[va_all])
-        oof_anc_full[va_m] = clf_full.predict_proba(X_alive_full[live_anchor_idx[va_m]])
+        X_va_clean = X_alive_full[live_anchor_idx[va_m]]
+        oof_anc_full[va_m] = clf_full.predict_proba(X_va_clean)
+        # Honest validation under duel stress (w=8 flicker + dropout)
+        X_va_noisy = _corrupt_ball_duel_batch(X_va_clean, rng, drop_p=0.25, flip_p=0.20)
+        oof_anc_noisy[va_m] = clf_full.predict_proba(X_va_noisy)
 
         X_tr_nb = X_noball[live_anchor_idx[tr_m]]
         clf_nb = _build_bin_clf(seed + 100 + fold, is_nb=True)
@@ -335,12 +414,21 @@ def fit_sentiment_specialist_gbdt_models(
 
     oof_anc_full /= np.maximum(np.sum(oof_anc_full, axis=1, keepdims=True), 1e-12)
     oof_anc_noball /= np.maximum(np.sum(oof_anc_noball, axis=1, keepdims=True), 1e-12)
+    oof_anc_noisy /= np.maximum(np.sum(oof_anc_noisy, axis=1, keepdims=True), 1e-12)
 
     metrics = {
         "n_live_anchors": int(len(live_anchor_idx)),
         "oof_ha_acc_full": float(accuracy_score(y_anc, np.argmax(oof_anc_full, axis=1))),
         "oof_ha_logloss_full": float(log_loss(y_anc, oof_anc_full)),
+        "oof_ha_acc_duel_stress": float(accuracy_score(y_anc, np.argmax(oof_anc_noisy, axis=1))),
+        "oof_ha_logloss_duel_stress": float(log_loss(y_anc, oof_anc_noisy)),
         "oof_ha_acc_noball": float(accuracy_score(y_anc, np.argmax(oof_anc_noball, axis=1))),
         "oof_ha_logloss_noball": float(log_loss(y_anc, oof_anc_noball)),
+        "live_anchor_idx": live_anchor_idx,
+        "y_anc": y_anc,
+        "b_anc": b_anc,
+        "oof_anc_full": oof_anc_full,
+        "oof_anc_noball": oof_anc_noball,
+        "oof_pi_h_frame": oof_pi_h_frame,
     }
     return oof_ha_full, oof_ha_noball, metrics

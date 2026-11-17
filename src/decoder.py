@@ -286,8 +286,9 @@ def _filter_sentiment_deflections(
                 if attacking:
                     codes[t_trans:t_reend] = prev_team
 
-    # Pass 3: Sentiment-aware pass-by flicker absorption inside sustained possessions
-    # Preserve fast VERTICAL_TRANSITION counter-attacks (dur >= 45 & mean_v >= 1.45 m/s)
+    # Pass 3: Evidence-Integrated & Sentiment-Aware Deflection Filter
+    # Preserve short counter-attacks that have low internal chaos AND aligned attacking velocity
+    # AND sustained log-odds evidence; absorb frantic chaotic flickers & non-progressive bounces.
     changed = True
     while changed:
         changed = False
@@ -295,7 +296,7 @@ def _filter_sentiment_deflections(
         if len(runs) < 3:
             break
         for i in range(1, len(runs) - 1):
-            s_r, e_r, _ = runs[i]
+            s_r, e_r, k_r = runs[i]
             dur = e_r - s_r
             prev_dur = runs[i - 1][1] - runs[i - 1][0]
             next_dur = runs[i + 1][1] - runs[i + 1][0]
@@ -303,17 +304,37 @@ def _filter_sentiment_deflections(
                 mean_v = float(np.mean(block_v_cam[s_r:e_r]))
                 tripod_frac = float(np.mean(block_v_cam[s_r:e_r] < 0.14))
                 mean_chaos = float(np.mean(block_chaos[s_r:e_r]))
+                dir_sign = 1.0 if k_r == 0 else -1.0
+                mean_vx_k = float(np.mean(block_vx_attack[s_r:e_r])) * dir_sign
+                mean_ev_k = float(np.mean(block_logit[s_r:e_r])) * dir_sign
+
+                # Genuine clean breakaway / sustained control protection (32..61f)
+                clean_break_protect = (
+                    dur >= 34
+                    and mean_chaos < 0.42
+                    and mean_vx_k > 1.10
+                    and mean_ev_k > 1.65
+                )
+
                 calm_speed_ok = (mean_v < 1.15) if mean_chaos > 0.70 else (mean_v < 1.40)
                 short_bounce_ok = dur < 48
+                # If fast (v_cam >= 1.40) yet chaotic without clean progression and ends slowly/stalled: absorb
+                chaotic_stall_flicker = (
+                    dur < 62
+                    and mean_chaos >= 0.48
+                    and mean_vx_k < 0.85
+                )
                 calm_cond = (
                     dur < 62
                     and (prev_dur + next_dur) >= 180
-                    and (calm_speed_ok or short_bounce_ok)
+                    and (calm_speed_ok or short_bounce_ok or chaotic_stall_flicker)
+                    and not clean_break_protect
                 )
                 tripod_cond = (
                     dur < 120
                     and (tripod_frac > 0.35 or (mean_v < 0.85 and mean_chaos < 0.55))
                     and (prev_dur + next_dur) >= 350
+                    and not clean_break_protect
                 )
                 if calm_cond or tripod_cond:
                     codes[s_r:e_r] = runs[i - 1][2]
@@ -324,9 +345,17 @@ def _filter_sentiment_deflections(
 
 
 def decode_sentiment_hybrid_match(
-    log_emit, features, regimes, sentiment, turnover_gate, logit_fused, half_blocks
+    log_emit,
+    features,
+    regimes,
+    sentiment,
+    turnover_gate,
+    logit_fused,
+    half_blocks,
+    turnover_gate_ha=None,
+    turnover_gate_ah=None,
 ):
-    """Stage 4 Decoder for Sentiment-Adaptive Hybrid Model (True Viterbi + Sentiment Deflection Filter)."""
+    """Stage 4 Decoder for Sentiment-Adaptive Hybrid Model (Directed Viterbi + Momentum Filter)."""
     n = len(log_emit)
     A_t = build_time_inhomogeneous_transition_matrices(
         n_frames=n,
@@ -336,6 +365,8 @@ def decode_sentiment_hybrid_match(
         turnover_gate=turnover_gate,
         stay_alive_penalty=4.6,
         stay_dead_penalty=6.8,
+        turnover_gate_ha=turnover_gate_ha,
+        turnover_gate_ah=turnover_gate_ah,
     )
 
     final_labels = np.full(n, "X", dtype="<U1")

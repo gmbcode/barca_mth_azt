@@ -54,6 +54,8 @@ def run_honest_masked_ball_stress_test(res):
         res["turnover_gate"],
         res["logit_fused"],
         half_blocks,
+        turnover_gate_ha=res.get("turnover_gate_ha"),
+        turnover_gate_ah=res.get("turnover_gate_ah"),
     )
     stressed_codes = pm.label_codes(stressed_labels)
 
@@ -66,7 +68,7 @@ def run_honest_masked_ball_stress_test(res):
 
 
 def main():
-    out_csv = os.path.join(ROOT, "evaluation", "results", "sentiment_hybrid_v1.csv")
+    out_csv = os.path.join(ROOT, "evaluation", "results", "sentiment_hybrid_v2.csv")
     res = run_sentiment_hybrid_pipeline(out_csv=out_csv)
     labels = res["labels"]
     pred_codes = pm.label_codes(labels)
@@ -76,15 +78,20 @@ def main():
     sent = res["sentiment"]
 
     print("=" * 88)
-    print("STAGE 3 SPECIALIST ML & SENTIMENT HYBRID — 6-FOLD TEMPORAL BLOCK OOF CV DIAGNOSTICS")
+    print("STAGE 3 SPECIALIST ML & SENTIMENT HYBRID v2 — 6-FOLD TEMPORAL BLOCK OOF CV DIAGNOSTICS")
     print("=" * 88)
-    print(f"Sharp Live Anchor Samples (Stride 4)  : {cv['n_live_anchors']} (H/A binary live anchors)")
-    print(f"GBDT_Alive_Full (Multimodal + 35%Drop): OOF Acc = {100*cv['oof_ha_acc_full']:.2f}% | "
+    print(f"Live Anchors (Clean+Border, Stride 4): {cv['n_live_anchors']} (H/A binary live anchors)")
+    print(f"GBDT_Alive_Full (Causal+22-Inv, Drop): OOF Acc = {100*cv['oof_ha_acc_full']:.2f}% | "
           f"LogLoss = {cv['oof_ha_logloss_full']:.4f}")
-    print(f"GBDT_Alive_NoBall (Half-Invariant Kin): OOF Acc = {100*cv['oof_ha_acc_noball']:.2f}% | "
+    print(f"GBDT_Alive_Full (Harsh Duel Stress)   : OOF Acc = {100*cv['oof_ha_acc_duel_stress']:.2f}% | "
+          f"LogLoss = {cv['oof_ha_logloss_duel_stress']:.4f}")
+    print(f"GBDT_Alive_NoBall (22-Inv Territory)  : OOF Acc = {100*cv['oof_ha_acc_noball']:.2f}% | "
           f"LogLoss = {cv['oof_ha_logloss_noball']:.4f}")
-    print(f"Crisp Dilated SeqRefiner (offsets+-20): OOF Acc = {100*seq_m['oof_acc_seq_refiner']:.2f}% | "
-          f"Sim2Real Drop = {100*seq_m['sim2real_drop_rate']:.1f}%")
+    print(f"Crisp Dilated SeqRefiner (Spike Noise): OOF Acc = {100*seq_m['oof_acc_seq_refiner']:.2f}% | "
+          f"Stress Acc = {100*seq_m['oof_acc_seq_stress']:.2f}% | Drop = {100*seq_m['sim2real_drop_rate']:.1f}%")
+    print(f"OOF L-BFGS-B Meta-Router Weights      : w_chaos_boost={rt['meta_w_chaos_boost']:.4f}, "
+          f"w_noball_in_ml={rt['meta_w_noball_in_ml']:.4f}, beta_flick_prior={rt['meta_beta_flick_prior']:.4f} "
+          f"| OOF LogLoss = {rt['oof_meta_logloss']:.4f}")
 
     # Match Sentiment Regime Breakdown on Graded Halves
     full_gt_dummy = np.full(len(labels), pm.X, dtype=np.int8)
@@ -105,7 +112,10 @@ def main():
         print(f"  [{idx}] {name:<20s}: {cnt:6d} frames ({pct:5.1f}%) | Mean Turnover Gate = {mg:.2f}")
     print(f"Mean Dynamic ML Weight w_ml(t) -> All={rt['mean_w_ml_all']:.3f} | "
           f"Calm={rt['mean_w_ml_calm']:.3f} | Chaos={rt['mean_w_ml_chaos']:.3f} | "
-          f"Tempo={rt['mean_w_ml_tempo']:.3f} | Occl={rt['mean_w_ml_occl']:.3f}")
+          f"Tempo={rt['mean_w_ml_tempo']:.3f} | Occl={rt['mean_w_ml_occl']:.3f} | "
+          f"ContestedOccl={rt['mean_w_ml_contested_occl']:.3f}")
+    print(f"Flick & Retention Directed Gates -> Mean H->A={rt['mean_gate_ha']:.3f} | Mean A->H={rt['mean_gate_ah']:.3f} | "
+          f"Contested Occl Frames={int(np.sum(sent['contested_occl'] & graded_mask))}")
 
     stress = run_honest_masked_ball_stress_test(res)
     print("\n" + "=" * 88)
@@ -149,6 +159,7 @@ def main():
             ("1. Physics (`physics` branch)", "physics_matrix_v1.csv"),
             ("2. ML Ensemble (`model-fitting`)", "ml_ensemble_v1.csv"),
             ("3. Sentiment Hybrid (`sentiment-hybrid`)", "sentiment_hybrid_v1.csv"),
+            ("4. Sentiment v2 (`sentiment-hybrid-v2`)", "sentiment_hybrid_v2.csv"),
         ]:
             fpath = os.path.join(ROOT, "evaluation", "results", fname)
             if not os.path.isfile(fpath):

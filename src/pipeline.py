@@ -139,19 +139,25 @@ def run_sentiment_hybrid_pipeline(game=GAME, data_dir=None, out_csv=None, seed=4
     bcast_sync = synchronize_broadcast_to_tactical(stage1, game=game, data_dir=data_dir)
     features = extract_physics_feature_dict(stage1, st_priors)
 
-    # Stage 3 — Tier 1 Physics Regimes & Emissions
-    regimes = detect_physical_regimes(features, stage1["half_blocks"])
+    # Stage 3 — Tier 1 Physics Regimes & Emissions (with Contested Missing-Ball Handover Detection)
+    regimes = detect_physical_regimes(features, stage1["half_blocks"], split_contested_occl=True)
     tier1_log_probs = compute_tier1_emission_log_probs(features, regimes)
 
-    # Stage 3 — Match Sentiment Tensor Psi_t
+    # Stage 3 — Match Sentiment Tensor Psi_t + Flick Tactical Signals
     sentiment = compute_match_sentiment_tensor(features, regimes)
 
-    # Stage 3 — Tier 2A (Baum-Welch EM), Tier 2B (Alive-Team Specialist ML), Tier 3 (Dilated Seq)
+    # Stage 3 — Tier 2A (Invariant Forward-Backward EM), Tier 2B (Duel-Robust Alive ML), Tier 3 (Crisp Seq)
     anchor_labels, graded_mask = _select_algorithmic_anchors(
         features, regimes, stage1["half_blocks"]
     )
     em_log_probs = fit_baum_welch_em(
-        features, regimes, tier1_log_probs, graded_mask, n_iter=4
+        features,
+        regimes,
+        tier1_log_probs,
+        graded_mask,
+        n_iter=4,
+        use_invariant_hmm=True,
+        half_blocks=stage1["half_blocks"],
     )
     oof_ha_full, oof_ha_noball, spec_cv_metrics = fit_sentiment_specialist_gbdt_models(
         features, anchor_labels, graded_mask, regimes=regimes, n_blocks=6, stride=4, seed=seed
@@ -175,10 +181,17 @@ def run_sentiment_hybrid_pipeline(game=GAME, data_dir=None, out_csv=None, seed=4
         seed=seed,
         offsets=CRISP_DILATED_OFFSETS,
         n_smooth_steps=3,
+        spike_noise_rate=0.18,
     )
 
-    # Sentiment-Adaptive Log-Odds Fusion & Dynamic Transition Gating
-    hybrid_log_probs, turnover_gate, logit_fused, routing_summary = fuse_models_by_match_sentiment(
+    # Sentiment-Adaptive OOF Meta-Stacked Fusion & Flick Directed Transition Gating
+    (
+        hybrid_log_probs,
+        turnover_gate_ha,
+        turnover_gate_ah,
+        logit_fused,
+        routing_summary,
+    ) = fuse_models_by_match_sentiment(
         features=features,
         regimes=regimes,
         sentiment=sentiment,
@@ -187,9 +200,11 @@ def run_sentiment_hybrid_pipeline(game=GAME, data_dir=None, out_csv=None, seed=4
         oof_ha_full=oof_ha_full,
         oof_ha_noball=oof_ha_noball,
         seq_log_probs=seq_log_probs,
+        spec_cv_metrics=spec_cv_metrics,
     )
+    turnover_gate = 0.5 * (turnover_gate_ha + turnover_gate_ah)
 
-    # Stage 4: True Viterbi + Sentiment Deflection Filter + Contact/Logit Inflection Snapper
+    # Stage 4: Directed Time-Inhomogeneous Viterbi + Evidence-Integrated Sentiment Filter
     labels = decode_sentiment_hybrid_match(
         hybrid_log_probs,
         features,
@@ -198,6 +213,8 @@ def run_sentiment_hybrid_pipeline(game=GAME, data_dir=None, out_csv=None, seed=4
         turnover_gate,
         logit_fused,
         stage1["half_blocks"],
+        turnover_gate_ha=turnover_gate_ha,
+        turnover_gate_ah=turnover_gate_ah,
     )
 
     if out_csv:
@@ -215,6 +232,8 @@ def run_sentiment_hybrid_pipeline(game=GAME, data_dir=None, out_csv=None, seed=4
         "log_probs": hybrid_log_probs,
         "logit_fused": logit_fused,
         "turnover_gate": turnover_gate,
+        "turnover_gate_ha": turnover_gate_ha,
+        "turnover_gate_ah": turnover_gate_ah,
         "oof_ha_full": oof_ha_full,
         "oof_ha_noball": oof_ha_noball,
         "spec_cv_metrics": spec_cv_metrics,
